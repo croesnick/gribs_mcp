@@ -73,10 +73,6 @@ _HEART_DATA_RE = re.compile(r'data-heart(?!wp)="(\d+)"')
 # the share HASH, not the id).
 _HASHFIELD_ID_RE = re.compile(r'id="hashfield_(\d+)"')
 
-# `inlinelink({...})` — the object body is HTML-entity-encoded in live
-# responses (`{&quot;cat&quot;:1,&quot;post_id&quot;:3102}`).
-_INLINELINK_RE = re.compile(r"inlinelink\(\s*(\{[^}]*\})\s*\)", re.DOTALL)
-
 # `structexp('id',{...},'idsuff','level','type')` — verified-live format; the
 # object body is HTML-entity-encoded (`{&quot;cat&quot;:&quot;1&quot;}`).
 _STRUCTEXP_RE = re.compile(
@@ -261,7 +257,7 @@ def parse_post_id_from_member_page(html_text: str | None) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# JS object parsing (structexp / inlinelink — HTML-entity-encoded quotes)
+# JS object parsing (structexp — HTML-entity-encoded quotes)
 # ---------------------------------------------------------------------------
 
 
@@ -290,53 +286,6 @@ def _parse_js_object(html_str: str, pattern: re.Pattern[str]) -> dict[str, Any] 
     except (json.JSONDecodeError, ValueError):
         return None
     return obj
-
-
-def _parse_inlinelink_object(html_str: str) -> dict[str, Any] | None:
-    """Parse the first `inlinelink({…})` JS object from an HTML string.
-
-    The live `views` field HTML-encodes quotes as `&quot;`, so the object body
-    looks like `{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,...}`.
-    Delegates to :func:`_parse_js_object` which unescapes then parses.
-    """
-    return _parse_js_object(html_str, _INLINELINK_RE)
-
-
-def _extract_post_id_from_views(views_html: str) -> int | None:
-    """Extract post_id from the first `inlinelink({..., post_id:N})` in `views`.
-
-    The `views` field of `/members/singlepost` is an HTML list of
-    recently-viewed favorites. The first entry's `inlinelink(...)` carries the
-    canonical post_id for THIS post (plus its full category path).
-    """
-    obj = _parse_inlinelink_object(views_html)
-    if obj is None:
-        return None
-    raw_post_id = obj.get("post_id")
-    if raw_post_id is None:
-        return None
-    try:
-        return int(raw_post_id)
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_category_path_from_views(views_html: str) -> dict[str, int | None]:
-    """Extract cat/l1/l2/l3 ids from the first `inlinelink({...})` in `views`.
-
-    Returns a dict with keys 'cat', 'l1', 'l2', 'l3' (values None if absent).
-    Useful for breadcrumb enrichment when the `header` field lacks them.
-    """
-    obj = _parse_inlinelink_object(views_html)
-    if obj is None:
-        return {"cat": None, "l1": None, "l2": None, "l3": None}
-
-    return {
-        "cat": _as_int(obj.get("cat")),
-        "l1": _as_int(obj.get("l1")),
-        "l2": _as_int(obj.get("l2")),
-        "l3": _as_int(obj.get("l3")),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -683,19 +632,15 @@ def parse_singlepost(json_response: Mapping[str, Any]) -> PostDetail:
       `<i class="bi bi-heart" data-heartwp="..." data-heart="<id>" ...>`
       favorite-toggle icon.
     - `header`: category banner with `<h1 class="member-banner-title">…</h1>`.
-    - `views`: HTML list of recently-viewed favorites. This is a
-      SESSION-GLOBAL "recently viewed" widget and is NOT a reliable
-      post_id source (the server updates it lazily, so after fetching post A,
-      every subsequent fetch inherits A's stale `views[0].post_id`). It is
-      used ONLY for category-path breadcrumb enrichment
-      (see :func:`_extract_category_path_from_views`).
+    - `views`: HTML list of recently-viewed favorites. SESSION-GLOBAL widget
+      the server updates lazily — NOT a reliable post_id source and not
+      consulted by this parser. Retained in the payload for API fidelity only.
 
     post_id extraction order (most-reliable first):
       1. `data-heart="<N>"` on the `<i class="bi bi-heart">` tag in `content`
          (bound to the rendered post).
       2. `id="hashfield_<N>"` on the share-hash input in `content`.
       3. `postWidget(<N>, ...)` call in `content` (legacy/older fixture format).
-    `views` is intentionally NOT consulted for post_id.
 
     Args:
         json_response: Parsed JSON dict from the API.
@@ -710,9 +655,6 @@ def parse_singlepost(json_response: Mapping[str, Any]) -> PostDetail:
     header = json_response.get("header", "")
     if not isinstance(header, str):
         header = ""
-    views = json_response.get("views", "")
-    if not isinstance(views, str):
-        views = ""
 
     # post_id: prefer the bound-to-rendered-post `data-heart` attribute, then
     # the `hashfield_<id>` input, then the legacy `postWidget(<id>)` call.

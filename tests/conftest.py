@@ -39,6 +39,8 @@ def search_response_html() -> str:
 
 # ---------------------------------------------------------------------------
 # /members/singlepost — JSON {error, content, header, views}
+# NOTE: `views` is a session-global recently-viewed widget, NOT consulted for
+# post_id (see Issue #11 / PR #12). Kept in fixtures for API fidelity only.
 # ---------------------------------------------------------------------------
 
 
@@ -68,12 +70,6 @@ def singlepost_html() -> str:
 def singlepost_header_html() -> str:
     """HTML content from the `header` field of `/members/singlepost`."""
     return _read_json("singlepost_response.json")["header"]
-
-
-@pytest.fixture
-def singlepost_views_html() -> str:
-    """HTML content from the `views` field of `/members/singlepost`."""
-    return _read_json("singlepost_response.json")["views"]
 
 
 # ---------------------------------------------------------------------------

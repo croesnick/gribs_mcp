@@ -138,9 +138,9 @@ class TestParseSinglepost:
     """Tests for `parse_singlepost` against the verified-live JSON shape.
 
     The response has four keys: `content` (body HTML with .posts-title,
-    .post-view-count, hashfield input), `header` (banner with
-    .member-banner-title), `views` (recently-viewed list with inlinelink
-    carrying the canonical post_id and category path).
+    .post-view-count, hashfield input, bi-heart favorite toggle), `header`
+    (banner with .member-banner-title), `views` (session-global recently-viewed
+    list — NOT consulted for post_id, see Issue #11).
     """
 
     def test_extracts_title_from_posts_title(
@@ -287,7 +287,7 @@ class TestParseSinglepost:
         assert post.post_id != 2492
 
     def test_post_id_none_when_uninferable(self) -> None:
-        # No inlinelink in views, no postWidget in content -> post_id is None.
+        # No data-heart, no hashfield_<N>, no postWidget in content -> post_id None.
         payload = {
             "error": False,
             "content": "<div><h1 class='posts-title'>Test</h1><p>no widget</p></div>",
