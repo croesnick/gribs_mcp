@@ -100,9 +100,10 @@ class PostDetail(BaseModel):
         Field(
             description=(
                 "Internal gribs post id, inferred from the response "
-                "(postWidget call and/or inlinelink in the `views` field). "
-                "None if inference failed; callers should treat None as a "
-                "trust-failure and refuse to act on the post."
+                "(data-heart attribute, hashfield id, or postWidget call in "
+                "the `content` field). None if inference failed; callers "
+                "should treat None as a trust-failure and refuse to act on "
+                "the post."
             )
         ),
     ]

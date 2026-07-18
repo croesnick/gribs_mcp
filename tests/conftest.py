@@ -39,6 +39,8 @@ def search_response_html() -> str:
 
 # ---------------------------------------------------------------------------
 # /members/singlepost — JSON {error, content, header, views}
+# NOTE: `views` is a session-global recently-viewed widget, NOT consulted for
+# post_id (see Issue #11 / PR #12). Kept in fixtures for API fidelity only.
 # ---------------------------------------------------------------------------
 
 
@@ -46,6 +48,16 @@ def search_response_html() -> str:
 def singlepost_response_json() -> dict[str, Any]:
     """Full JSON payload from `/members/singlepost` (content+header+views)."""
     return _read_json("singlepost_response.json")
+
+
+@pytest.fixture
+def singlepost_stale_views_json() -> dict[str, Any]:
+    """Regression fixture (Issue #11): content carries post_id 3102 (via
+    `data-heart`, `id="hashfield_3102"`, `postWidget(3102, 'share')`), but the
+    `views` field carries a STALE `post_id:2492` from a previously-viewed post.
+    `parse_singlepost` must return `post_id == 3102`, NOT 2492.
+    """
+    return _read_json("singlepost_stale_views.json")
 
 
 @pytest.fixture
@@ -58,12 +70,6 @@ def singlepost_html() -> str:
 def singlepost_header_html() -> str:
     """HTML content from the `header` field of `/members/singlepost`."""
     return _read_json("singlepost_response.json")["header"]
-
-
-@pytest.fixture
-def singlepost_views_html() -> str:
-    """HTML content from the `views` field of `/members/singlepost`."""
-    return _read_json("singlepost_response.json")["views"]
 
 
 # ---------------------------------------------------------------------------

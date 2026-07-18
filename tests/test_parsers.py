@@ -138,9 +138,9 @@ class TestParseSinglepost:
     """Tests for `parse_singlepost` against the verified-live JSON shape.
 
     The response has four keys: `content` (body HTML with .posts-title,
-    .post-view-count, hashfield input), `header` (banner with
-    .member-banner-title), `views` (recently-viewed list with inlinelink
-    carrying the canonical post_id and category path).
+    .post-view-count, hashfield input, bi-heart favorite toggle), `header`
+    (banner with .member-banner-title), `views` (session-global recently-viewed
+    list — NOT consulted for post_id, see Issue #11).
     """
 
     def test_extracts_title_from_posts_title(
@@ -149,11 +149,12 @@ class TestParseSinglepost:
         post = parse_singlepost(singlepost_response_json)
         assert post.title == "Musterantrag: Trinkwasserschutz im Gemeindegebiet"
 
-    def test_extracts_post_id_from_views_inlinelink(
+    def test_extracts_post_id_from_content_heart(
         self, singlepost_response_json: dict
     ) -> None:
-        # The canonical post_id lives in the `views` field's inlinelink(...),
-        # NOT just in the content's postWidget() call.
+        # The canonical post_id lives in the `data-heart="<N>"` attribute on
+        # the `<i class="bi bi-heart">` tag in `content` (NOT in `views`,
+        # which is a session-global "recently viewed" list and unreliable).
         post = parse_singlepost(singlepost_response_json)
         assert post.post_id == 3102
 
@@ -225,9 +226,43 @@ class TestParseSinglepost:
         post = parse_singlepost(singlepost_response_json)
         assert post.retrieved_at is not None
 
+    def test_post_id_uses_heart_when_present(self) -> None:
+        # Priority 1: `data-heart` is the primary source when present.
+        payload = {
+            "error": False,
+            "content": (
+                "<div><h1 class='posts-title'>Test</h1>"
+                "<i class='bi bi-heart' data-heartwp='17588' data-heart=\"1111\" "
+                "onclick='addheart(this);'></i>"
+                "<input id='hashfield_2222' value='https://www.gribs.net/?h=abc'>"
+                "<script>postWidget(3333, 'share');</script></div>"
+            ),
+            "header": "",
+            "views": "",
+        }
+        post = parse_singlepost(payload)
+        assert post.post_id == 1111
+
+    def test_post_id_falls_back_to_hashfield_when_heart_absent(self) -> None:
+        # Priority 2: when `data-heart` is absent, fall back to
+        # `id="hashfield_<N>"`.
+        payload = {
+            "error": False,
+            "content": (
+                "<div><h1 class='posts-title'>Test</h1>"
+                "<input id=\"hashfield_2222\" value='https://www.gribs.net/?h=abc'>"
+                "<script>postWidget(3333, 'share');</script></div>"
+            ),
+            "header": "",
+            "views": "",
+        }
+        post = parse_singlepost(payload)
+        assert post.post_id == 2222
+
     def test_post_id_falls_back_to_content_post_widget(self) -> None:
-        # When `views` is missing/empty, post_id is inferred from the
-        # postWidget() call in `content`.
+        # Priority 3: when both `data-heart` and `hashfield_<N>` are absent,
+        # post_id is inferred from the `postWidget(<id>)` call in `content`
+        # (legacy/older fixture format).
         payload = {
             "error": False,
             "content": (
@@ -240,8 +275,19 @@ class TestParseSinglepost:
         post = parse_singlepost(payload)
         assert post.post_id == 9999
 
+    def test_post_id_ignores_stale_views(
+        self, singlepost_stale_views_json: dict
+    ) -> None:
+        # Regression (Issue #11): `views` is a session-global "recently viewed"
+        # list that's lazily updated — it carries a STALE post_id (here 2492
+        # from a previously-viewed post). The post_id must come from the
+        # `content` field (here `data-heart="3102"`), NOT from `views`.
+        post = parse_singlepost(singlepost_stale_views_json)
+        assert post.post_id == 3102
+        assert post.post_id != 2492
+
     def test_post_id_none_when_uninferable(self) -> None:
-        # No inlinelink in views, no postWidget in content -> post_id is None.
+        # No data-heart, no hashfield_<N>, no postWidget in content -> post_id None.
         payload = {
             "error": False,
             "content": "<div><h1 class='posts-title'>Test</h1><p>no widget</p></div>",
@@ -267,13 +313,19 @@ class TestParseSinglepost:
     ) -> None:
         # When share_hash is absent and only post_id is known, url falls back
         # to the members landing page (gribs has no ?p=<id> deep-link).
+        # post_id comes from `data-heart` in `content` (NOT from `views` —
+        # `views` is no longer consulted for post_id, Issue #11).
         views_html = (
             '<div onclick="inlinelink({cat:1, l1:7, l2:115, '
-            'l3:null, post_id:42})">x</div>'
+            'l3:null, post_id:2492})">stale</div>'
         )
         payload = {
             "error": False,
-            "content": "<div><h1 class='posts-title'>Test</h1></div>",
+            "content": (
+                "<div><h1 class='posts-title'>Test</h1>"
+                "<i class='bi bi-heart' data-heartwp='17588' data-heart=\"42\""
+                " onclick='addheart(this);'></i></div>"
+            ),
             "header": "",
             "views": views_html,
         }
