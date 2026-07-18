@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from gribs_mcp.parsers import (
+    parse_downloads,
     parse_expand_structure,
+    parse_post_id_from_member_page,
     parse_post_widget,
     parse_recent_posts,
     parse_search_results,
@@ -485,6 +487,158 @@ class TestParsePostWidget:
         html = "<div class='pwidget-title'>Truncated title...</div>"
         teaser = parse_post_widget(html, post_id=1)
         assert teaser.title == "Truncated title..."
+
+
+class TestParsePostIdFromMemberPage:
+    """Tests for `parse_post_id_from_member_page` (wp_id -> post_id resolution)."""
+
+    def test_extracts_post_id_from_json_blob(
+        self, member_page_wp_19880_html: str
+    ) -> None:
+        # The live member page embeds `"post_id":"3097"` in a JS config blob.
+        post_id = parse_post_id_from_member_page(member_page_wp_19880_html)
+        assert post_id == 3097
+
+    def test_extracts_unquoted_post_id(self) -> None:
+        # Some pages may have `"post_id":3097` (no quotes around the number).
+        html = '<script>var data = {"post_id":3097};</script>'
+        assert parse_post_id_from_member_page(html) == 3097
+
+    def test_returns_none_when_no_match(self) -> None:
+        html = "<html><body>no post_id here</body></html>"
+        assert parse_post_id_from_member_page(html) is None
+
+    def test_returns_none_on_empty(self) -> None:
+        assert parse_post_id_from_member_page("") is None
+
+    def test_extracts_first_match(self) -> None:
+        # If multiple post_id entries exist, the first one wins.
+        html = '<script>{"post_id":1111,"other":{"post_id":2222}}</script>'
+        assert parse_post_id_from_member_page(html) == 1111
+
+
+class TestParseDownloads:
+    """Tests for `parse_downloads` — extracts PDF + download-looking links."""
+
+    def test_extracts_pdf_links(self, post_body_with_downloads_html: str) -> None:
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        urls = [d.url for d in downloads]
+        assert "https://www.gribs.net/files/antrag_wasserschutz.pdf" in urls
+        assert "https://www.gribs.net/files/vorlage_beschluss.pdf" in urls
+
+    def test_filters_non_download_links(
+        self, post_body_with_downloads_html: str
+    ) -> None:
+        # The "Über gribs" link has no .pdf and no download keyword -> excluded.
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        urls = [d.url for d in downloads]
+        assert "https://www.gribs.net/about" not in urls
+
+    def test_includes_keyword_only_links(
+        self, post_body_with_downloads_html: str
+    ) -> None:
+        # The .docx link has "musterantrag" in the URL text (anchor text is
+        # "Musterantrag extern") -> included even though not .pdf.
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        urls = [d.url for d in downloads]
+        assert "https://example.org/musterantrag.docx" in urls
+
+    def test_is_pdf_flag(self, post_body_with_downloads_html: str) -> None:
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        by_url = {d.url: d for d in downloads}
+        assert by_url["https://www.gribs.net/files/antrag_wasserschutz.pdf"].is_pdf
+        assert by_url["https://www.gribs.net/files/vorlage_beschluss.pdf"].is_pdf
+        assert not by_url["https://example.org/musterantrag.docx"].is_pdf
+
+    def test_filename_extracted(self, post_body_with_downloads_html: str) -> None:
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        by_url = {d.url: d for d in downloads}
+        assert (
+            by_url["https://www.gribs.net/files/antrag_wasserschutz.pdf"].filename
+            == "antrag_wasserschutz.pdf"
+        )
+        assert (
+            by_url["https://www.gribs.net/files/vorlage_beschluss.pdf"].filename
+            == "vorlage_beschluss.pdf"
+        )
+
+    def test_link_text_extracted(self, post_body_with_downloads_html: str) -> None:
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        by_url = {d.url: d for d in downloads}
+        assert (
+            by_url["https://www.gribs.net/files/antrag_wasserschutz.pdf"].link_text
+            == "Antrag als PDF herunterladen"
+        )
+        assert (
+            by_url["https://www.gribs.net/files/vorlage_beschluss.pdf"].link_text
+            == "Vorlage Beschluss (PDF)"
+        )
+
+    def test_quellenpflicht_fields(self, post_body_with_downloads_html: str) -> None:
+        downloads = parse_downloads(
+            post_body_with_downloads_html,
+            post_id=3102,
+            source_url="https://www.gribs.net/?h=abc123",
+        )
+        for d in downloads:
+            assert d.source_post_id == 3102
+            assert d.source_url == "https://www.gribs.net/?h=abc123"
+            assert d.retrieved_at is not None
+
+    def test_deduplicates_by_url(self) -> None:
+        # Same URL appearing twice -> only one Download entry.
+        body = (
+            "<div>"
+            '<a href="https://www.gribs.net/files/doc.pdf">First</a>'
+            '<a href="https://www.gribs.net/files/doc.pdf">Second</a>'
+            "</div>"
+        )
+        downloads = parse_downloads(
+            body, post_id=1, source_url="https://www.gribs.net/"
+        )
+        assert len(downloads) == 1
+        assert downloads[0].link_text == "First"  # first-seen wins
+
+    def test_resolves_relative_urls(self) -> None:
+        body = '<div><a href="/files/relative.pdf">Relative PDF</a></div>'
+        downloads = parse_downloads(
+            body, post_id=1, source_url="https://www.gribs.net/"
+        )
+        assert len(downloads) == 1
+        assert downloads[0].url == "https://www.gribs.net/files/relative.pdf"
+
+    def test_empty_body(self) -> None:
+        assert parse_downloads("", post_id=1, source_url="https://www.gribs.net/") == []
+
+    def test_no_anchors(self) -> None:
+        body = "<div><p>No links here</p></div>"
+        assert (
+            parse_downloads(body, post_id=1, source_url="https://www.gribs.net/") == []
+        )
 
 
 if __name__ == "__main__":

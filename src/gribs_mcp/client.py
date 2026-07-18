@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any
+import logging
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import httpx
 
@@ -26,15 +28,62 @@ from gribs_mcp import auth, parsers
 from gribs_mcp.auth import AuthError, CookieEntry
 from gribs_mcp.models import (
     CategoryNode,
+    ExpandStructureResponse,
     PostDetail,
+    PostIdRef,
     PostTeaser,
     SearchHit,
+    SinglepostResponse,
     StructureExpansion,
+    StructureResponse,
+    _GribsApiResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.gribs.net"
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 USER_AGENT = "gribs-mcp/0.1 (+https://www.gribs.net/)"
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time (tz-aware)."""
+    return datetime.now(UTC)
+
+
+def _serialize_cookies(jar: httpx.Cookies) -> list[CookieEntry]:
+    """Serialize an httpx cookie jar into the keyring-cache format (pure)."""
+    entries: list[CookieEntry] = []
+    for cookie in jar.jar:
+        entries.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value or "",
+                "domain": cookie.domain or "www.gribs.net",
+                "path": cookie.path or "/",
+                "expires": cookie.expires,
+            }
+        )
+    return entries
+
+
+def _looks_like_success(body: Any) -> bool:
+    """Heuristic: a login response indicating success.
+
+    gribs returns ~15-byte non-JSON status payloads. Treat truthy non-dict
+    values as success. The dict case is handled separately in
+    :meth:`GribsClient._validate_login_response` (this helper is only reached
+    when no session cookie was set, to decide whether to surface a failure).
+    """
+    if body is None:
+        return False
+    if isinstance(body, bool):
+        return body
+    if isinstance(body, (int, float)):
+        return body > 0
+    if isinstance(body, str):
+        return body.strip() in {"1", "true", "ok", "OK", "success"}
+    return False
 
 
 class GribsAuthError(AuthError):
@@ -96,6 +145,11 @@ class GribsClient:
                         domain=entry.get("domain") or "www.gribs.net",
                         path=entry.get("path") or "/",
                     )
+                logger.debug("Hydrated %d cookies from keyring cache", len(cached))
+            else:
+                logger.debug(
+                    "No cached cookies; will log in on first authenticated call"
+                )
         return self._client
 
     async def aclose(self) -> None:
@@ -137,6 +191,7 @@ class GribsClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         if resp.status_code >= 400:
+            logger.warning("Login HTTP %d for email=%s", resp.status_code, email)
             raise GribsAuthError(f"Login HTTP {resp.status_code}: {resp.text[:200]}")
 
         # Login returns a 15-byte non-JSON status (e.g. "1" or ""). Success is
@@ -145,29 +200,45 @@ class GribsClient:
         with contextlib.suppress(ValueError, httpx.DecodingError):
             body = resp.json()
 
-        cookie_set = bool(client.cookies)
+        self._validate_login_response(resp, body, email)
+
+        # Persist cookies to keyring.
+        entries = _serialize_cookies(client.cookies)
+        auth.store_cookies(entries)
+        self._credentials = auth.Credentials(email=email, password=password)
+        logger.info(
+            "Login successful for email=%s; cached %d cookies",
+            email,
+            len(entries),
+        )
+
+    @staticmethod
+    def _validate_login_response(resp: httpx.Response, body: Any, email: str) -> None:
+        """Validate the login response, raising GribsAuthError on rejection.
+
+        Args:
+            resp: The httpx response (used for cookie inspection — never logged).
+            body: Best-effort parsed JSON body (may be None if non-JSON).
+            email: The email used (for logging — never the password).
+
+        Raises:
+            GribsAuthError: if the login was rejected (error field set) or
+                no session cookie was set and the body doesn't look like success.
+        """
+        cookie_set = bool(resp.cookies)
         if isinstance(body, dict):
             err = body.get("error")
             if err not in (None, False, "false", 0, "0"):
+                logger.warning("Login rejected for email=%s: %s", email, body)
                 raise GribsAuthError(f"Login rejected: {body}")
 
         if not cookie_set and not _looks_like_success(body):
-            raise GribsAuthError(f"Login did not set a session cookie (body={body!r})")
-
-        # Persist cookies to keyring.
-        entries: list[CookieEntry] = []
-        for cookie in client.cookies.jar:
-            entries.append(
-                {
-                    "name": cookie.name,
-                    "value": cookie.value or "",
-                    "domain": cookie.domain or "www.gribs.net",
-                    "path": cookie.path or "/",
-                    "expires": cookie.expires,
-                }
+            logger.warning(
+                "Login did not set session cookie for email=%s (body=%r)",
+                email,
+                body,
             )
-        auth.store_cookies(entries)
-        self._credentials = auth.Credentials(email=email, password=password)
+            raise GribsAuthError(f"Login did not set a session cookie (body={body!r})")
 
     async def ensure_session(self) -> None:
         """Ensure we have a fresh logged-in session.
@@ -210,19 +281,22 @@ class GribsClient:
         resp = await client.post(endpoint, data=data, headers=headers)
 
         if resp.status_code in (401, 403) and allow_relogin:
-            # Serialize re-login so concurrent 401s only trigger one login.
+            logger.info("Got HTTP %d on %s; re-logging in", resp.status_code, endpoint)
+            # Serialize re-login so concurrent 401s don't trigger N parallel
+            # login attempts. We deleted cookies above so this login is fresh;
+            # concurrent waiters on `_login_lock` will also call login() —
+            # acceptable because login is idempotent (gribs re-issues the same
+            # session cookie for the same credentials).
             async with self._login_lock:
-                # Clear any cached cookies — they were just rejected by the
-                # server, so `load_cookies()` freshness checks (age/expiry)
-                # don't apply. This also lets concurrent tasks that acquired
-                # the lock after us see "no cookies" and skip their own login.
+                # Clear the rejected cookies from both the keyring cache and
+                # the live jar. `load_cookies()` freshness checks (age/expiry)
+                # don't catch server-side revocation, so we force-clear here.
                 auth.delete_cookies()
                 client.cookies.clear()
-                if not auth.load_cookies():
-                    try:
-                        await self.login()
-                    except GribsAuthError as exc:
-                        raise GribsAuthError(f"Re-login failed: {exc}") from exc
+                try:
+                    await self.login()
+                except GribsAuthError as exc:
+                    raise GribsAuthError(f"Re-login failed: {exc}") from exc
             resp = await client.post(endpoint, data=data, headers=headers)
 
         if resp.status_code >= 400:
@@ -237,7 +311,7 @@ class GribsClient:
         data: dict[str, Any],
         *,
         allow_relogin: bool = True,
-    ) -> dict[str, Any]:
+    ) -> _GribsApiResponse:
         """POST and return parsed JSON dict, with auth retry.
 
         Raises:
@@ -253,6 +327,7 @@ class GribsClient:
             raise GribsApiError(f"POST {endpoint} -> non-JSON response: {exc}") from exc
 
         if not isinstance(payload, dict):
+            logger.warning("POST %s returned non-dict JSON: %r", endpoint, payload)
             raise GribsApiError(
                 f"POST {endpoint} -> unexpected JSON shape: {payload!r}"
             )
@@ -260,7 +335,7 @@ class GribsClient:
         if payload.get("error") not in (None, False, "false", 0, "0"):
             raise GribsApiError(f"POST {endpoint} -> API error: {payload}")
 
-        return payload
+        return payload  # type: ignore[return-value]
 
     async def _post_form_html(
         self,
@@ -343,8 +418,11 @@ class GribsClient:
                 `post_id` (silent-wrong-post guard, see Oracle C3).
         """
         await self.ensure_session()
-        payload = await self._post_form_json(
-            "/members/singlepost", {"post_id": str(post_id)}
+        payload = cast(
+            SinglepostResponse,
+            await self._post_form_json(
+                "/members/singlepost", {"post_id": str(post_id)}
+            ),
         )
         post = await parsers.parse_singlepost_async(payload)
         # Guard against silent wrong-post fetches: if we couldn't confirm the
@@ -385,7 +463,10 @@ class GribsClient:
             "type": "load",
             "sort": "false",
         }
-        payload = await self._post_form_json("/members/structure", data)
+        payload = cast(
+            StructureResponse,
+            await self._post_form_json("/members/structure", data),
+        )
         navigation = payload.get("navigation", "")
         if not isinstance(navigation, str):
             return CategoryNode(id=category_id, label=root_label, children=[])
@@ -437,7 +518,10 @@ class GribsClient:
                 data["obj[l2]"] = str(l2)
             if l3 is not None:
                 data["obj[l3]"] = str(l3)
-        payload = await self._post_form_json("/members/expandStructure", data)
+        payload = cast(
+            ExpandStructureResponse,
+            await self._post_form_json("/members/expandStructure", data),
+        )
 
         # Intermediate nodes carry subcategories in `structure`.
         structure = payload.get("structure", "")
@@ -448,6 +532,54 @@ class GribsClient:
         # must use search() with the category_level*_id conditions to list
         # posts in a leaf — there is no direct listing here.
         return StructureExpansion(subcategories=None, posts=None)
+
+    async def resolve_post_id(self, wp_id: int) -> PostIdRef:
+        """Resolve a WordPress `wp_id` to an internal `post_id` via `GET /?wp=<id>`.
+
+        Live-verified path: `GET /?wp=<id>` with `follow_redirects=True` returns
+        the member page at `/members/home/wp-<id>` which contains
+        `"post_id":"<N>"` (or `"post_id":<N>`) in a JSON-ish context. We
+        regex-extract the first match.
+
+        This is the bridge from `search_antraege` (which returns `wp_id`s) to
+        `get_antrag` (which needs `post_id`s).
+
+        Args:
+            wp_id: WordPress post id (from a `?wp=<id>` deep link).
+
+        Returns:
+            PostIdRef with `wp_id`, `post_id`, `url`, and `retrieved_at`
+            (Quellenpflicht).
+
+        Raises:
+            GribsApiError: if the request fails or no `post_id` can be
+                extracted from the response.
+        """
+        client = await self._ensure_client()
+        try:
+            resp = await client.get(f"/?wp={wp_id}", follow_redirects=True)
+        except httpx.HTTPError as exc:
+            raise GribsApiError(f"GET /?wp={wp_id} -> transport error: {exc}") from exc
+        if resp.status_code >= 400:
+            raise GribsApiError(
+                f"GET /?wp={wp_id} -> HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        post_id = parsers.parse_post_id_from_member_page(resp.text)
+        if post_id is None:
+            logger.warning(
+                "Could not extract post_id from /?wp=%d response (len=%d)",
+                wp_id,
+                len(resp.text),
+            )
+            raise GribsApiError(
+                f"GET /?wp={wp_id} -> could not extract post_id from response"
+            )
+        return PostIdRef(
+            wp_id=wp_id,
+            post_id=post_id,
+            url=f"https://www.gribs.net/?wp={wp_id}",
+            retrieved_at=_utcnow(),
+        )
 
     async def fill_post_widget(self, post_id: int, caller: str = "start") -> str:
         """Fetch the teaser HTML for a single post via `/members/postWidgetFill`.
@@ -478,9 +610,10 @@ class GribsClient:
 
         The recentposts response contains only post widget scaffolds (post_id
         + spinner), NOT titles. The browser lazy-loads each teaser via
-        `/members/postWidgetFill`. This method performs that N+1 enrichment:
-        1 request for the scaffold + 1 per post (3 total for the default 3
-        posts). For the MVP this is acceptable; no batching optimization.
+        `/members/postWidgetFill`. This method performs that N+1 enrichment
+        concurrently: 1 request for the scaffold + N parallel `postWidgetFill`
+        calls (3 parallel for the default 3 posts). The order of results
+        matches the scaffold order (asyncio.gather preserves ordering).
 
         Returns:
             Up to 3 PostTeaser objects with title (full, from `title` attr),
@@ -493,20 +626,20 @@ class GribsClient:
         scaffolds = await asyncio.to_thread(parsers.parse_recent_posts, scaffold_html)
         if not scaffolds:
             return []
-        # Enrich each scaffold with title/date via postWidgetFill.
-        enriched: list[PostTeaser] = []
-        for scaffold in scaffolds:
+
+        async def _enrich(scaffold: PostTeaser) -> PostTeaser:
             try:
                 widget_html = await self.fill_post_widget(scaffold.post_id)
-                teaser = await asyncio.to_thread(
+                return await asyncio.to_thread(
                     parsers.parse_post_widget, widget_html, scaffold.post_id
                 )
-            except GribsApiError:
+            except (GribsApiError, httpx.HTTPError):
                 # If enrichment fails for one post, keep the scaffold (title
                 # will be "Post <id>") rather than dropping it entirely.
-                teaser = scaffold
-            enriched.append(teaser)
-        return enriched
+                return scaffold
+
+        # Concurrent enrichment — all fill_post_widget calls fire in parallel.
+        return list(await asyncio.gather(*(_enrich(s) for s in scaffolds)))
 
 
 # Module-level singleton getter (per INTENT.md: do not instantiate per-call).
@@ -519,25 +652,6 @@ def get_client() -> GribsClient:
     if _CLIENT is None:
         _CLIENT = GribsClient()
     return _CLIENT
-
-
-def _looks_like_success(body: Any) -> bool:
-    """Heuristic: a login response indicating success.
-
-    gribs returns ~15-byte non-JSON status payloads. Treat truthy non-dict
-    values as success. The dict case is handled separately in :meth:`login`
-    (this helper is only reached when no session cookie was set, to decide
-    whether to surface a failure).
-    """
-    if body is None:
-        return False
-    if isinstance(body, bool):
-        return body
-    if isinstance(body, (int, float)):
-        return body > 0
-    if isinstance(body, str):
-        return body.strip() in {"1", "true", "ok", "OK", "success"}
-    return False
 
 
 __all__ = [

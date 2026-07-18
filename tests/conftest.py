@@ -167,3 +167,28 @@ def postwidgetfill_3202_html() -> str:
 def postwidgetfill_3203_html() -> str:
     """Raw HTML from `/members/postWidgetFill` for post_id=3203."""
     return _read("postwidgetfill_3203.html")
+
+
+# ---------------------------------------------------------------------------
+# GET /?wp=<id> — member page (raw HTML, used for wp_id -> post_id resolution)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def member_page_wp_19880_html() -> str:
+    """Raw HTML from `GET /?wp=19880` (redirects to /members/home/wp-19880).
+
+    Contains `"post_id":"3097"` in a JSON-ish JS blob.
+    """
+    return _read("member_page_wp_19880.html")
+
+
+# ---------------------------------------------------------------------------
+# Post body with download links (for parse_downloads tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def post_body_with_downloads_html() -> str:
+    """Post body HTML with 2 PDF links + 1 non-PDF + 1 keyword-only link."""
+    return _read("post_body_with_downloads.html")

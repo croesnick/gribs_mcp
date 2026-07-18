@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 # trafilatura is untyped (see mypy override). Blocking pure-Python extractor.
 import trafilatura
@@ -21,22 +22,106 @@ from selectolax.parser import HTMLParser
 
 from gribs_mcp.models import (
     CategoryNode,
+    Download,
     PostDetail,
     PostTeaser,
     SearchHit,
+    SinglepostResponse,
     StructureExpansion,
 )
 
+logger = logging.getLogger(__name__)
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
+# ---------------------------------------------------------------------------
+# Constants & compiled regex patterns
+# ---------------------------------------------------------------------------
 
 # gribs.net supports `?h=<hash>` and `?wp=<id>` deep-links only.
 # There is NO `?p=<post_id>` deep-link on gribs (verified live). When only
 # post_id is known and no hash/wp is available, we fall back to the members
 # landing page rather than fabricate a broken URL.
 MEMBERS_LANDING_URL = "https://www.gribs.net/members/home"
+
+# Search / deep-link extraction.
+_WP_RE = re.compile(r"[?&]wp=(\d+)")
+_HASH_RE = re.compile(r"[?&]h=([0-9a-fA-F]+)")
+
+# postWidget(<id>, ...) calls — used to infer post_id from content body and
+# recent-posts / expand-structure widget scaffolds.
+_POST_ID_RE = re.compile(r"postWidget\(\s*(\d+)")
+
+# `<span class="post-view-count">N</span>` (verified live singlepost format).
+_VIEW_COUNT_SPAN_RE = re.compile(r"post-view-count[^>]*>\s*(\d+)\s*<", re.IGNORECASE)
+
+# `<input id="hashfield_<id>" value="https://www.gribs.net/?h=<hash>">` — the
+# dedicated share-hash field in singlepost content.
+_HASHFIELD_RE = re.compile(
+    r'id="hashfield_\d+"[^>]*value="https://www\.gribs\.net/\?h=([0-9a-fA-F]+)"'
+)
+
+# `inlinelink({...})` — the object body is HTML-entity-encoded in live
+# responses (`{&quot;cat&quot;:1,&quot;post_id&quot;:3102}`).
+_INLINELINK_RE = re.compile(r"inlinelink\(\s*(\{[^}]*\})\s*\)", re.DOTALL)
+
+# `structexp('id',{...},'idsuff','level','type')` — verified-live format; the
+# object body is HTML-entity-encoded (`{&quot;cat&quot;:&quot;1&quot;}`).
+_STRUCTEXP_RE = re.compile(
+    r"structexp\(\s*'[^']*'\s*,\s*(\{[^}]*\})\s*,\s*'[^']*'\s*,\s*'[^']*'\s*,\s*'[^']*'\s*\)",
+    re.DOTALL,
+)
+# Legacy fallback: `structexp(1, 7, 12, null)` positional args.
+_STRUCTEXP_LEGACY_RE = re.compile(r"structexp\(([^)]*)\)")
+
+# `id='N_pid'` attribute on post-widget containers (recentposts scaffold).
+_PID_ATTR_RE = re.compile(r"^(\d+)_pid$")
+
+# `"post_id":"<N>"` (or `"post_id":<N>`) embedded in the member page returned
+# by `GET /?wp=<id>` — used for wp_id → post_id resolution.
+_POST_ID_FROM_PAGE_RE = re.compile(r'"post_id"\s*:\s*"?(\d+)"?')
+
+# Anchor text keywords that signal a download link even if the URL doesn't
+# end in .pdf (e.g. "Antrag herunterladen" linking to a gribs-hosted file).
+_DOWNLOAD_KEYWORDS = (
+    "download",
+    "pdf",
+    "antrag",
+    "vorlage",
+    "beschluss",
+    "musterantrag",
+    "herunterladen",
+)
+
+
+# ---------------------------------------------------------------------------
+# Small extraction helpers (single-responsity, ~1-3 lines each)
+# ---------------------------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time (tz-aware)."""
+    return datetime.now(UTC)
+
+
+def _first_int(pattern: re.Pattern[str], text: str | None) -> int | None:
+    """Search `text` for `pattern`; return the first capture group as int, or None."""
+    if not text:
+        return None
+    match = pattern.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (ValueError, IndexError):
+        return None
+
+
+def _first_str(pattern: re.Pattern[str], text: str | None) -> str | None:
+    """Search `text` for `pattern`; return the first capture group as str, or None."""
+    if not text:
+        return None
+    match = pattern.search(text)
+    return match.group(1) if match else None
 
 
 def _gribs_url(
@@ -57,8 +142,22 @@ def _gribs_url(
     return MEMBERS_LANDING_URL
 
 
+def _extract_wp_id(text: str | None) -> int | None:
+    """Extract `wp` id from any string containing `?wp=<id>` or `&wp=<id>`.
+
+    Handles both plain hrefs (`href="...?wp=19880"`) and onclick handlers
+    (`onclick="document.location.href='...?wp=19880'"`).
+    """
+    return _first_int(_WP_RE, text)
+
+
 def _extract_wp_id_from_href(href: str | None) -> int | None:
-    """Extract `wp` query param from a URL, returning it as int or None."""
+    """Extract `wp` query param from a URL via strict query parsing.
+
+    Stricter than :func:`_extract_wp_id` (which regexes the raw string); used
+    for the anchor-format fallback in :func:`parse_search_results` and for
+    recentposts href fallback.
+    """
     if not href:
         return None
     qs = parse_qs(urlsplit(href).query)
@@ -71,26 +170,314 @@ def _extract_wp_id_from_href(href: str | None) -> int | None:
         return None
 
 
-_WP_RE = re.compile(r"[?&]wp=(\d+)")
-_HASH_RE = re.compile(r"[?&]h=([0-9a-fA-F]+)")
-_POST_ID_RE = re.compile(r"postWidget\(\s*(\d+)")
+def _extract_view_count(content_html: str | None) -> int | None:
+    """Extract view count from `<span class="post-view-count">N</span>`.
 
-
-def _extract_wp_id(text: str | None) -> int | None:
-    """Extract `wp` id from any string containing `?wp=<id>` or `&wp=<id>`.
-
-    Handles both plain hrefs (`href="...?wp=19880"`) and onclick handlers
-    (`onclick="document.location.href='...?wp=19880'"`).
+    The verified live format uses this dedicated span; the old 'Views: N' /
+    'Aufrufe' text regex no longer matches and has been removed.
     """
-    if not text:
+    return _first_int(_VIEW_COUNT_SPAN_RE, content_html)
+
+
+def _extract_share_hash_from_hashfield(content_html: str | None) -> str | None:
+    """Extract share hash from `<input id="hashfield_<id>" value="...?h=<hash>">."""
+    return _first_str(_HASHFIELD_RE, content_html)
+
+
+def _extract_share_hash(content_html: str | None) -> str | None:
+    """Fallback: extract any `?h=<hash>` from raw HTML (looser than hashfield)."""
+    return _first_str(_HASH_RE, content_html)
+
+
+def _infer_post_id_from_content(content_html: str | None) -> int | None:
+    """Best-effort: extract post_id from a `postWidget(<id>, ...)` call.
+
+    Returns None if no match is found. The canonical post_id lives in the
+    `views` field (see :func:`_extract_post_id_from_views`); this helper is a
+    fallback for responses missing `views`.
+    """
+    if not isinstance(content_html, str):
         return None
-    match = _WP_RE.search(text)
+    return _first_int(_POST_ID_RE, content_html)
+
+
+def parse_post_id_from_member_page(html_text: str | None) -> int | None:
+    """Extract `post_id` from a `/members/home/wp-<id>` member page.
+
+    The live page embeds `"post_id":"<N>"` (or `"post_id":<N>`) in a
+    JSON-ish context (e.g. a JS config blob). We regex-extract the first match.
+
+    Args:
+        html_text: Full HTML response body from `GET /?wp=<wp_id>` (after
+            redirect).
+
+    Returns:
+        The post_id as int, or None if no match is found.
+    """
+    post_id = _first_int(_POST_ID_FROM_PAGE_RE, html_text)
+    if post_id is None and html_text:
+        logger.debug("post_id regex did not match (html len=%d)", len(html_text))
+    return post_id
+
+
+# ---------------------------------------------------------------------------
+# JS object parsing (structexp / inlinelink — HTML-entity-encoded quotes)
+# ---------------------------------------------------------------------------
+
+
+def _parse_js_object(html_str: str, pattern: re.Pattern[str]) -> dict[str, Any] | None:
+    """Extract and parse a JS object literal from an HTML string.
+
+    Handles the verified-live format where the object's quotes are HTML-entity
+    encoded (`{&quot;cat&quot;:&quot;1&quot;}`): we unescape HTML entities first,
+    then quote any still-unquoted keys, then json.loads.
+
+    Args:
+        html_str: The raw HTML string (e.g. an onclick attribute value).
+        pattern: Compiled regex with one capturing group for the object body.
+
+    Returns:
+        Parsed dict, or None if no match / parse failure.
+    """
+    match = pattern.search(html_str)
     if not match:
         return None
+    obj_str = html.unescape(match.group(1))
+    # Quote unquoted JS keys: `{cat:1}` -> `{"cat":1}`. Skips already-quoted keys.
+    quoted = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', obj_str)
     try:
-        return int(match.group(1))
-    except ValueError:
+        obj: dict[str, Any] = json.loads(quoted)
+    except (json.JSONDecodeError, ValueError):
         return None
+    return obj
+
+
+def _parse_inlinelink_object(html_str: str) -> dict[str, Any] | None:
+    """Parse the first `inlinelink({…})` JS object from an HTML string.
+
+    The live `views` field HTML-encodes quotes as `&quot;`, so the object body
+    looks like `{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,...}`.
+    Delegates to :func:`_parse_js_object` which unescapes then parses.
+    """
+    return _parse_js_object(html_str, _INLINELINK_RE)
+
+
+def _extract_post_id_from_views(views_html: str) -> int | None:
+    """Extract post_id from the first `inlinelink({..., post_id:N})` in `views`.
+
+    The `views` field of `/members/singlepost` is an HTML list of
+    recently-viewed favorites. The first entry's `inlinelink(...)` carries the
+    canonical post_id for THIS post (plus its full category path).
+    """
+    obj = _parse_inlinelink_object(views_html)
+    if obj is None:
+        return None
+    raw_post_id = obj.get("post_id")
+    if raw_post_id is None:
+        return None
+    try:
+        return int(raw_post_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_category_path_from_views(views_html: str) -> dict[str, int | None]:
+    """Extract cat/l1/l2/l3 ids from the first `inlinelink({...})` in `views`.
+
+    Returns a dict with keys 'cat', 'l1', 'l2', 'l3' (values None if absent).
+    Useful for breadcrumb enrichment when the `header` field lacks them.
+    """
+    obj = _parse_inlinelink_object(views_html)
+    if obj is None:
+        return {"cat": None, "l1": None, "l2": None, "l3": None}
+
+    def _as_int(v: Any) -> int | None:
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "cat": _as_int(obj.get("cat")),
+        "l1": _as_int(obj.get("l1")),
+        "l2": _as_int(obj.get("l2")),
+        "l3": _as_int(obj.get("l3")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# structexp arg parsing (category tree navigation)
+# ---------------------------------------------------------------------------
+
+
+def _parse_struct_label(node: Any) -> str:
+    """Extract label text from a `.menu-struct-label` node."""
+    text = node.text() if hasattr(node, "text") else ""
+    return (text or "").strip()
+
+
+def _parse_structexp_args(
+    node: Any,
+) -> tuple[int, int | None, int | None, int | None] | None:
+    """Extract cat / l1 / l2 / l3 ids from a node containing `structexp(...)`.
+
+    Handles two formats:
+
+    1. **Verified live** (HTML-entity-encoded object):
+       `structexp('m_l1_1',{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;1&quot;},'1_1','l1','load')`
+       — the object's quotes are HTML-encoded; we unescape then parse.
+
+    2. **Legacy positional**: `structexp(1, 7, 12, null)` — positional ints.
+
+    Returns (cat, l1, l2, l3) with None for missing. Returns None if no
+    `structexp(...)` call is found at all.
+    """
+    onclick = node.attributes.get("onclick", "") if hasattr(node, "attributes") else ""
+    if not onclick:
+        # Also scan child elements (the label may be inside the clickable).
+        for child in node.iter() if hasattr(node, "iter") else []:
+            onclick = (
+                child.attributes.get("onclick", "")
+                if hasattr(child, "attributes")
+                else ""
+            )
+            if onclick:
+                break
+    if not onclick:
+        return None
+
+    def _as_int(v: Any) -> int | None:
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    # Primary: verified-live object format.
+    obj = _parse_js_object(onclick, _STRUCTEXP_RE)
+    if obj is not None:
+        cat = _as_int(obj.get("cat")) or 0
+        l1 = _as_int(obj.get("l1"))
+        l2 = _as_int(obj.get("l2"))
+        l3 = _as_int(obj.get("l3"))
+        return cat, l1, l2, l3
+
+    # Legacy fallback: positional args `structexp(cat, l1, l2, l3)`.
+    legacy_match = _STRUCTEXP_LEGACY_RE.search(onclick)
+    if not legacy_match:
+        return None
+    args_str = legacy_match.group(1)
+    # Skip the object format (handled above) — only parse pure positional.
+    if "{" in args_str:
+        return None
+    args: list[int | None] = []
+    for raw in args_str.split(","):
+        raw = raw.strip()
+        # Strip surrounding quotes (e.g. 'm_l1_1' is not an int).
+        if raw.startswith(("'", '"')) and raw.endswith(("'", '"')):
+            args.append(None)
+            continue
+        if not raw or raw.lower() in {"null", "none", "undefined"}:
+            args.append(None)
+            continue
+        try:
+            args.append(int(raw))
+        except ValueError:
+            args.append(None)
+    while len(args) < 4:
+        args.append(None)
+    cat = args[0] if args[0] is not None else 0
+    return cat, args[1], args[2], args[3]
+
+
+# ---------------------------------------------------------------------------
+# Common HTML extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_banner_title(header_html: str) -> str | None:
+    """Extract the category banner title from `<h1 class="member-banner-title">`.
+
+    The `header` field of `/members/singlepost` contains this banner whose
+    text is the post's top-level category name (e.g. "Umwelt"). Used as the
+    primary breadcrumb source.
+    """
+    if not header_html:
+        return None
+    tree = HTMLParser(header_html)
+    node = tree.css_first(".member-banner-title, h1.member-banner-title")
+    if node is None:
+        return None
+    text = (node.text() or "").strip()
+    return text or None
+
+
+def _parse_breadcrumb(tree: HTMLParser) -> list[str]:
+    """Extract breadcrumb path. Looks for `.breadcrumb` list items.
+
+    Returns an empty list when no breadcrumb is found — this is valid and
+    means the post had no parseable breadcrumb in its `content` field.
+    """
+    items = tree.css(".breadcrumb li")
+    if items:
+        return [(i.text() or "").strip() for i in items if (i.text() or "").strip()]
+    # Fallback: any element with breadcrumb-ish class.
+    items = tree.css("[class*=breadcrumb] a, [class*=Breadcrumb] a")
+    return [(i.text() or "").strip() for i in items if (i.text() or "").strip()]
+
+
+def _extract_body_html(tree: HTMLParser) -> str:
+    """Locate the main post body HTML.
+
+    Selectors tried in order:
+    - `.posts-body` (verified-live format for `/members/singlepost` content).
+    - `.single-post-content` / `.post-content` / `.entry-content` (fallbacks).
+    - `article` (last resort).
+    """
+    for selector in (
+        ".posts-body",
+        ".single-post-content",
+        ".post-content",
+        ".entry-content",
+        "article",
+    ):
+        node = tree.css_first(selector)
+        if node is not None:
+            return node.html or ""
+    return ""
+
+
+def _extract_body_text(body_html: str) -> str:
+    """Extract cleaned plaintext from a body HTML fragment.
+
+    Tries trafilatura on a full-document wrapper first (it's designed for
+    full HTML documents, not fragments — passing a bare fragment returns
+    None). If trafilatura returns None/empty, falls back to selectolax's
+    `HTMLParser.text()` which strips tags and normalizes whitespace. This
+    ensures body_text is never empty when body_html has content.
+    """
+    if not body_html:
+        return ""
+    doc = (
+        body_html
+        if "<html" in body_html.lower()
+        else f"<html><body>{body_html}</body></html>"
+    )
+    extracted = trafilatura.extract(doc, include_comments=False, include_tables=False)
+    body_text = (extracted or "").strip()
+    if body_text:
+        return body_text
+    # Fallback: selectolax tag-strip + whitespace normalize.
+    body_tree = HTMLParser(body_html)
+    return (body_tree.text() or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# parse_search_results
+# ---------------------------------------------------------------------------
 
 
 def parse_search_results(html: str) -> list[SearchHit]:
@@ -193,159 +580,75 @@ def parse_search_results(html: str) -> list[SearchHit]:
     return hits
 
 
-def _extract_share_hash(html: str) -> str | None:
-    match = _HASH_RE.search(html)
-    return match.group(1) if match else None
+# ---------------------------------------------------------------------------
+# parse_singlepost (split into focused helpers)
+# ---------------------------------------------------------------------------
 
 
-# Matches `<span class="post-view-count">N</span>` (verified live format).
-_VIEW_COUNT_SPAN_RE = re.compile(r"post-view-count[^>]*>\s*(\d+)\s*<", re.IGNORECASE)
+def _extract_singlepost_title(tree: HTMLParser) -> str:
+    """Extract the post title from the singlepost content tree.
 
-# Matches `id="hashfield_<id>" value="https://www.gribs.net/?h=<hash>"`.
-_HASHFIELD_RE = re.compile(
-    r'id="hashfield_\d+"[^>]*value="https://www\.gribs\.net/\?h=([0-9a-fA-F]+)"'
-)
-
-
-def _extract_view_count(content_html: str) -> int | None:
-    """Extract view count from `<span class="post-view-count">N</span>`.
-
-    The verified live format uses this dedicated span; the old 'Views: N' /
-    'Aufrufe' text regex no longer matches and has been removed.
-    """
-    match = _VIEW_COUNT_SPAN_RE.search(content_html)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def _extract_share_hash_from_hashfield(content_html: str) -> str | None:
-    """Extract share hash from `<input id="hashfield_<id>" value="...?h=<hash>">."""
-    match = _HASHFIELD_RE.search(content_html)
-    return match.group(1) if match else None
-
-
-def _extract_post_id_from_views(views_html: str) -> int | None:
-    """Extract post_id from the first `inlinelink({..., post_id:N})` in `views`.
-
-    The `views` field of `/members/singlepost` is an HTML list of
-    recently-viewed favorites. The first entry's `inlinelink(...)` carries the
-    canonical post_id for THIS post (plus its full category path).
-    """
-    obj = _parse_inlinelink_object(views_html)
-    if obj is None:
-        return None
-    raw_post_id = obj.get("post_id")
-    if raw_post_id is None:
-        return None
-    try:
-        return int(raw_post_id)
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_category_path_from_views(views_html: str) -> dict[str, int | None]:
-    """Extract cat/l1/l2/l3 ids from the first `inlinelink({...})` in `views`.
-
-    Returns a dict with keys 'cat', 'l1', 'l2', 'l3' (values None if absent).
-    Useful for breadcrumb enrichment when the `header` field lacks them.
-    """
-    obj = _parse_inlinelink_object(views_html)
-    if obj is None:
-        return {"cat": None, "l1": None, "l2": None, "l3": None}
-
-    def _as_int(v: Any) -> int | None:
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    return {
-        "cat": _as_int(obj.get("cat")),
-        "l1": _as_int(obj.get("l1")),
-        "l2": _as_int(obj.get("l2")),
-        "l3": _as_int(obj.get("l3")),
-    }
-
-
-# Matches `inlinelink({…})` — the object body is HTML-entity-encoded in live
-# responses (`{&quot;cat&quot;:1,&quot;post_id&quot;:3102}`).
-_INLINELINK_RE = re.compile(r"inlinelink\(\s*(\{[^}]*\})\s*\)", re.DOTALL)
-
-
-def _parse_inlinelink_object(html_str: str) -> dict[str, Any] | None:
-    """Parse the first `inlinelink({…})` JS object from an HTML string.
-
-    The live `views` field HTML-encodes quotes as `&quot;`, so the object body
-    looks like `{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,...}`.
-    Delegates to :func:`_parse_js_object` which unescapes then parses.
-    """
-    return _parse_js_object(html_str, _INLINELINK_RE)
-
-
-def _extract_banner_title(header_html: str) -> str | None:
-    """Extract the category banner title from `<h1 class="member-banner-title">`.
-
-    The `header` field of `/members/singlepost` contains this banner whose
-    text is the post's top-level category name (e.g. "Umwelt"). Used as the
-    primary breadcrumb source.
-    """
-    if not header_html:
-        return None
-    tree = HTMLParser(header_html)
-    node = tree.css_first(".member-banner-title, h1.member-banner-title")
-    if node is None:
-        return None
-    text = (node.text() or "").strip()
-    return text or None
-
-
-def _strip_tags(html_fragment: str) -> str:
-    """Cheap tag stripper for breadcrumb text."""
-    return re.sub(r"<[^>]+>", "", html_fragment).strip()
-
-
-def _parse_breadcrumb(tree: HTMLParser) -> list[str]:
-    """Extract breadcrumb path. Looks for `.breadcrumb` list items.
-
-    Returns an empty list when no breadcrumb is found — this is valid and
-    means the post had no parseable breadcrumb in its `content` field.
-    """
-    items = tree.css(".breadcrumb li")
-    if items:
-        return [(i.text() or "").strip() for i in items if (i.text() or "").strip()]
-    # Fallback: any element with breadcrumb-ish class.
-    items = tree.css("[class*=breadcrumb] a, [class*=Breadcrumb] a")
-    return [(i.text() or "").strip() for i in items if (i.text() or "").strip()]
-
-
-def _extract_body_html(tree: HTMLParser) -> str:
-    """Locate the main post body HTML.
-
-    Selectors tried in order:
-    - `.posts-body` (verified-live format for `/members/singlepost` content).
-    - `.single-post-content` / `.post-content` / `.entry-content` (fallbacks).
-    - `article` (last resort).
+    Tries `.posts-title` (verified live) first, then generic h1/h2/.post-title
+    fallbacks. Returns empty string if no title found.
     """
     for selector in (
-        ".posts-body",
-        ".single-post-content",
-        ".post-content",
-        ".entry-content",
-        "article",
+        ".posts-title",
+        "h1.post-title",
+        "h1",
+        "h2.post-title",
+        "h2",
+        ".post-title",
     ):
         node = tree.css_first(selector)
-        if node is not None:
-            return node.html or ""
+        text = (node.text() or "").strip() if node is not None else ""
+        if text:
+            return text
     return ""
 
 
-def parse_singlepost(json_response: dict[str, Any]) -> PostDetail:
+def _extract_singlepost_date(tree: HTMLParser) -> str | None:
+    """Extract the display date from any element with a date-like class."""
+    node = tree.css_first("[class*=date], [class*=Date], time")
+    if node is None:
+        return None
+    return (node.text() or "").strip() or None
+
+
+def _extract_singlepost_share_url(content: str) -> str | None:
+    """Build the share URL from the hashfield input, falling back to any `?h=`.
+
+    Returns the full `https://www.gribs.net/?h=<hash>` URL, or None if no
+    share hash is present in the content.
+    """
+    share_hash = _extract_share_hash_from_hashfield(content)
+    if share_hash is None:
+        share_hash = _extract_share_hash(content)
+    if share_hash is None:
+        return None
+    return f"https://www.gribs.net/?h={share_hash}"
+
+
+def _extract_singlepost_breadcrumb(tree: HTMLParser, header: str) -> list[str]:
+    """Build the breadcrumb from the header banner + content breadcrumb list.
+
+    Prefers the `.member-banner-title` from the `header` field (top-level
+    category name), then appends any `.breadcrumb` list items from `content`.
+    De-duplicates the banner title if it's already the first breadcrumb entry.
+    """
+    breadcrumb: list[str] = []
+    banner_title = _extract_banner_title(header)
+    if banner_title:
+        breadcrumb.append(banner_title)
+    content_breadcrumb = _parse_breadcrumb(tree)
+    if content_breadcrumb and (
+        not breadcrumb or breadcrumb[0] != content_breadcrumb[0]
+    ):
+        # Avoid duplicating the banner title if it's already the first entry.
+        breadcrumb.extend(content_breadcrumb)
+    return breadcrumb
+
+
+def parse_singlepost(json_response: SinglepostResponse) -> PostDetail:
     """Parse `/members/singlepost` JSON response into PostDetail.
 
     The verified-live response has four string keys (all HTML except `error`):
@@ -378,227 +681,29 @@ def parse_singlepost(json_response: dict[str, Any]) -> PostDetail:
     # the postWidget() call in `content`.
     post_id = _extract_post_id_from_views(views)
     if post_id is None:
+        logger.debug("post_id from views failed; falling back to content postWidget()")
         post_id = _infer_post_id_from_content(content)
 
     tree = HTMLParser(content)
-
-    # Title: prefer .posts-title (verified live), then generic fallbacks.
-    title = ""
-    for selector in (
-        ".posts-title",
-        "h1.post-title",
-        "h1",
-        "h2.post-title",
-        "h2",
-        ".post-title",
-    ):
-        node = tree.css_first(selector)
-        text = (node.text() or "").strip() if node is not None else ""
-        if text:
-            title = text
-            break
-
-    # Date: any element with class containing 'date'.
-    date: str | None = None
-    node = tree.css_first("[class*=date], [class*=Date], time")
-    if node is not None:
-        date = (node.text() or "").strip() or None
-
-    # View count: <span class="post-view-count">N</span> (verified live).
-    view_count = _extract_view_count(content)
-
-    # Share hash: prefer the dedicated hashfield input, fall back to any ?h=.
-    share_hash = _extract_share_hash_from_hashfield(content)
-    if share_hash is None:
-        share_hash = _extract_share_hash(content)
-    share_url = f"https://www.gribs.net/?h={share_hash}" if share_hash else None
-
-    # Breadcrumb: prefer the banner title from `header`; fall back to the
-    # `.breadcrumb` list in `content` if present.
-    breadcrumb: list[str] = []
-    banner_title = _extract_banner_title(header)
-    if banner_title:
-        breadcrumb.append(banner_title)
-    content_breadcrumb = _parse_breadcrumb(tree)
-    if content_breadcrumb and (
-        not breadcrumb or breadcrumb[0] != content_breadcrumb[0]
-    ):
-        # Avoid duplicating the banner title if it's already the first entry.
-        breadcrumb.extend(content_breadcrumb)
-
     body_html = _extract_body_html(tree)
 
-    # Body text: try trafilatura on a full-document wrapper first (it's
-    # designed for full HTML documents, not fragments — passing a bare
-    # fragment returns None). If trafilatura returns None/empty, fall back
-    # to selectolax's HTMLParser.text() which strips tags and normalizes
-    # whitespace. This ensures body_text is never empty when body_html has
-    # content (Bug 3 fix).
-    body_text = ""
-    if body_html:
-        doc = (
-            body_html
-            if "<html" in body_html.lower()
-            else f"<html><body>{body_html}</body></html>"
-        )
-        extracted = trafilatura.extract(
-            doc, include_comments=False, include_tables=False
-        )
-        body_text = (extracted or "").strip()
-        if not body_text:
-            # Fallback: selectolax tag-strip + whitespace normalize.
-            body_tree = HTMLParser(body_html)
-            body_text = (body_tree.text() or "").strip()
-
-    url = share_url or _gribs_url(post_id=post_id)
     return PostDetail(
         post_id=post_id,
-        title=title,
-        date=date,
-        view_count=view_count,
-        share_url=share_url,
-        category_breadcrumb=breadcrumb,
+        title=_extract_singlepost_title(tree),
+        date=_extract_singlepost_date(tree),
+        view_count=_extract_view_count(content),
+        share_url=_extract_singlepost_share_url(content),
+        category_breadcrumb=_extract_singlepost_breadcrumb(tree, header),
         body_html=body_html,
-        body_text=body_text,
-        url=url,
+        body_text=_extract_body_text(body_html),
+        url=_extract_singlepost_share_url(content) or _gribs_url(post_id=post_id),
         retrieved_at=_utcnow(),
     )
 
 
-def _infer_post_id_from_content(content_html: str) -> int | None:
-    """Best-effort: extract post_id from a `postWidget(<id>, ...)` call.
-
-    Returns None if no match is found. The canonical post_id lives in the
-    `views` field (see `_extract_post_id_from_views`); this helper is a
-    fallback for responses missing `views`.
-    """
-    if not isinstance(content_html, str):
-        return None
-    match = _POST_ID_RE.search(content_html)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def _parse_struct_label(node: Any) -> str:
-    """Extract label text from a `.menu-struct-label` node."""
-    text = node.text() if hasattr(node, "text") else ""
-    return (text or "").strip()
-
-
-# Matches `structexp('id',{...},'idsuff','level','type')`. The object body is
-# HTML-entity-encoded in the live response (`{&quot;cat&quot;:&quot;1&quot;}`).
-_STRUCTEXP_RE = re.compile(
-    r"structexp\(\s*'[^']*'\s*,\s*(\{[^}]*\})\s*,\s*'[^']*'\s*,\s*'[^']*'\s*,\s*'[^']*'\s*\)",
-    re.DOTALL,
-)
-# Legacy fallback: `structexp(1, 7, 12, null)` positional args.
-_STRUCTEXP_LEGACY_RE = re.compile(r"structexp\(([^)]*)\)")
-
-
-def _parse_js_object(html_str: str, pattern: re.Pattern[str]) -> dict[str, Any] | None:
-    """Extract and parse a JS object literal from an HTML string.
-
-    Handles the verified-live format where the object's quotes are HTML-entity
-    encoded (`{&quot;cat&quot;:&quot;1&quot;}`): we unescape HTML entities first,
-    then quote any still-unquoted keys, then json.loads.
-
-    Args:
-        html_str: The raw HTML string (e.g. an onclick attribute value).
-        pattern: Compiled regex with one capturing group for the object body.
-
-    Returns:
-        Parsed dict, or None if no match / parse failure.
-    """
-    match = pattern.search(html_str)
-    if not match:
-        return None
-    obj_str = html.unescape(match.group(1))
-    # Quote unquoted JS keys: `{cat:1}` -> `{"cat":1}`. Skips already-quoted keys.
-    quoted = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', obj_str)
-    try:
-        obj: dict[str, Any] = json.loads(quoted)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return obj
-
-
-def _parse_structexp_args(
-    node: Any,
-) -> tuple[int, int | None, int | None, int | None] | None:
-    """Extract cat / l1 / l2 / l3 ids from a node containing `structexp(...)`.
-
-    Handles two formats:
-
-    1. **Verified live** (HTML-entity-encoded object):
-       `structexp('m_l1_1',{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;1&quot;},'1_1','l1','load')`
-       — the object's quotes are HTML-encoded; we unescape then parse.
-
-    2. **Legacy positional**: `structexp(1, 7, 12, null)` — positional ints.
-
-    Returns (cat, l1, l2, l3) with None for missing. Returns None if no
-    `structexp(...)` call is found at all.
-    """
-    onclick = node.attributes.get("onclick", "") if hasattr(node, "attributes") else ""
-    if not onclick:
-        # Also scan child elements (the label may be inside the clickable).
-        for child in node.iter() if hasattr(node, "iter") else []:
-            onclick = (
-                child.attributes.get("onclick", "")
-                if hasattr(child, "attributes")
-                else ""
-            )
-            if onclick:
-                break
-    if not onclick:
-        return None
-
-    def _as_int(v: Any) -> int | None:
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    # Primary: verified-live object format.
-    obj = _parse_js_object(onclick, _STRUCTEXP_RE)
-    if obj is not None:
-        cat = _as_int(obj.get("cat")) or 0
-        l1 = _as_int(obj.get("l1"))
-        l2 = _as_int(obj.get("l2"))
-        l3 = _as_int(obj.get("l3"))
-        return cat, l1, l2, l3
-
-    # Legacy fallback: positional args `structexp(cat, l1, l2, l3)`.
-    legacy_match = _STRUCTEXP_LEGACY_RE.search(onclick)
-    if not legacy_match:
-        return None
-    args_str = legacy_match.group(1)
-    # Skip the object format (handled above) — only parse pure positional.
-    if "{" in args_str:
-        return None
-    args: list[int | None] = []
-    for raw in args_str.split(","):
-        raw = raw.strip()
-        # Strip surrounding quotes (e.g. 'm_l1_1' is not an int).
-        if raw.startswith(("'", '"')) and raw.endswith(("'", '"')):
-            args.append(None)
-            continue
-        if not raw or raw.lower() in {"null", "none", "undefined"}:
-            args.append(None)
-            continue
-        try:
-            args.append(int(raw))
-        except ValueError:
-            args.append(None)
-    while len(args) < 4:
-        args.append(None)
-    cat = args[0] if args[0] is not None else 0
-    return cat, args[1], args[2], args[3]
+# ---------------------------------------------------------------------------
+# parse_structure (category tree)
+# ---------------------------------------------------------------------------
 
 
 def parse_structure(html: str, root_label: str = "") -> CategoryNode:
@@ -646,6 +751,11 @@ def parse_structure(html: str, root_label: str = "") -> CategoryNode:
     return CategoryNode(id=root_cat_id, label=root_label, children=children)
 
 
+# ---------------------------------------------------------------------------
+# parse_expand_structure (intermediate subcategories or leaf posts)
+# ---------------------------------------------------------------------------
+
+
 def parse_expand_structure(html: str) -> StructureExpansion:
     """Parse `/members/expandStructure` HTML into either subcategories or posts.
 
@@ -673,14 +783,8 @@ def parse_expand_structure(html: str) -> StructureExpansion:
         seen: set[int] = set()
         for widget in post_widgets:
             widget_html = widget.html or ""
-            match = _POST_ID_RE.search(widget_html)
-            if not match:
-                continue
-            try:
-                post_id = int(match.group(1))
-            except ValueError:
-                continue
-            if post_id in seen:
+            post_id = _first_int(_POST_ID_RE, widget_html)
+            if post_id is None or post_id in seen:
                 continue
             seen.add(post_id)
 
@@ -731,6 +835,11 @@ def parse_expand_structure(html: str) -> StructureExpansion:
     return StructureExpansion(subcategories=subcategories or None, posts=None)
 
 
+# ---------------------------------------------------------------------------
+# parse_recent_posts (public recentposts endpoint scaffold)
+# ---------------------------------------------------------------------------
+
+
 def parse_recent_posts(html: str) -> list[PostTeaser]:
     """Parse `/post/recentposts` HTML into a list of PostTeaser.
 
@@ -738,7 +847,7 @@ def parse_recent_posts(html: str) -> list[PostTeaser]:
 
         <div class='startpage-recent'>
           <div class='post-widget' id='3103_pid'>
-            <script>postWidget(3103,'3103_pid','members');</script>
+            <script>postWidget(3103,'3103_pid','start');</script>
             ...title/date/snippet markup...
           </div>
           ...
@@ -757,20 +866,9 @@ def parse_recent_posts(html: str) -> list[PostTeaser]:
     posts: list[PostTeaser] = []
     seen: set[int] = set()
 
-    # Match `id='N_pid'` or `id="N_pid"` on post-widget containers.
-    _PID_ATTR_RE = re.compile(r"^(\d+)_pid$")
-
     for container in tree.css(".post-widget, .recent-post, article"):
         widget_html = container.html or ""
-        post_id: int | None = None
-
-        # Primary: postWidget(N, ...) call (verified live format).
-        match = _POST_ID_RE.search(widget_html)
-        if match:
-            try:
-                post_id = int(match.group(1))
-            except ValueError:
-                post_id = None
+        post_id: int | None = _first_int(_POST_ID_RE, widget_html)
 
         # Fallback 1: id='N_pid' attribute on the container itself.
         if post_id is None:
@@ -822,6 +920,11 @@ def parse_recent_posts(html: str) -> list[PostTeaser]:
     return posts
 
 
+# ---------------------------------------------------------------------------
+# parse_post_widget (postWidgetFill response)
+# ---------------------------------------------------------------------------
+
+
 def parse_post_widget(html: str, post_id: int) -> PostTeaser:
     """Parse `/members/postWidgetFill` HTML into a PostTeaser.
 
@@ -867,7 +970,97 @@ def parse_post_widget(html: str, post_id: int) -> PostTeaser:
     )
 
 
-async def parse_singlepost_async(json_response: dict[str, Any]) -> PostDetail:
+# ---------------------------------------------------------------------------
+# parse_downloads (PDF / download-link extraction from post bodies)
+# ---------------------------------------------------------------------------
+
+
+def parse_downloads(
+    body_html: str,
+    post_id: int,
+    source_url: str,
+    base_url: str = "https://www.gribs.net/",
+) -> list[Download]:
+    """Extract download links (PDFs and download-looking anchors) from post body HTML.
+
+    A link is considered a download if EITHER:
+    - The URL path ends in `.pdf` (case-insensitive), OR
+    - The anchor text contains a download keyword
+      (download/pdf/antrag/vorlage/beschluss/musterantrag/herunterladen).
+
+    Relative URLs are resolved against `base_url` (default: gribs.net root).
+    Duplicates (by resolved URL) are de-duplicated, preserving first-seen order.
+
+    Args:
+        body_html: The `body_html` field of a `PostDetail` (raw HTML fragment).
+        post_id: The post_id of the source post (for `source_post_id`).
+        source_url: The canonical URL of the source post (Quellenpflicht).
+        base_url: Base URL for resolving relative links.
+
+    Returns:
+        List of Download objects (may be empty). Each carries `source_post_id`,
+        `source_url`, and `retrieved_at` for Quellenpflicht.
+    """
+    if not body_html:
+        return []
+
+    tree = HTMLParser(body_html)
+    now = _utcnow()
+    downloads: list[Download] = []
+    seen_urls: set[str] = set()
+
+    for anchor in tree.css("a[href]"):
+        href = anchor.attributes.get("href", "") or ""
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+
+        link_text = (anchor.text() or "").strip()
+        resolved = urljoin(base_url, href)
+        path = urlsplit(resolved).path.lower()
+        is_pdf = path.endswith(".pdf")
+
+        # Include if PDF or download keyword in link text.
+        text_lower = link_text.lower()
+        looks_like_download = is_pdf or any(
+            kw in text_lower for kw in _DOWNLOAD_KEYWORDS
+        )
+        if not looks_like_download:
+            continue
+
+        if resolved in seen_urls:
+            continue
+        seen_urls.add(resolved)
+
+        # Filename: last path segment, if non-empty.
+        filename: str | None = None
+        seg = path.rsplit("/", 1)[-1] if path else ""
+        if seg:
+            filename = seg
+
+        downloads.append(
+            Download(
+                url=resolved,
+                link_text=link_text or filename or resolved,
+                filename=filename,
+                is_pdf=is_pdf,
+                source_post_id=post_id,
+                source_url=source_url,
+                retrieved_at=now,
+            )
+        )
+
+    logger.debug(
+        "extract_downloads: post_id=%d → %d downloads", post_id, len(downloads)
+    )
+    return downloads
+
+
+# ---------------------------------------------------------------------------
+# Async wrapper
+# ---------------------------------------------------------------------------
+
+
+async def parse_singlepost_async(json_response: SinglepostResponse) -> PostDetail:
     """Wrap parse_singlepost for callers wanting to offload trafilatura's blocking work.
 
     trafilatura is CPU-bound and synchronous. Use this in client code that runs
@@ -878,7 +1071,9 @@ async def parse_singlepost_async(json_response: dict[str, Any]) -> PostDetail:
 
 __all__ = [
     "MEMBERS_LANDING_URL",
+    "parse_downloads",
     "parse_expand_structure",
+    "parse_post_id_from_member_page",
     "parse_post_widget",
     "parse_recent_posts",
     "parse_search_results",

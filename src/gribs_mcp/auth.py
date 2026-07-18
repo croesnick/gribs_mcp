@@ -21,18 +21,24 @@ import asyncio
 import contextlib
 import getpass
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import keyring
+
+logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "gribs_mcp"
 CREDENTIAL_KEY = "credentials"
 COOKIE_KEY = "cookies"
 
-COOKIE_MAX_AGE: timedelta = timedelta(days=5)
+# Cookie cache TTL. Live verification showed gribs sessions with `keep=true`
+# last for weeks; 30 days is conservative and the client re-logs in on 401/403
+# regardless, so an over-long TTL just means fewer proactive re-logins.
+COOKIE_MAX_AGE: timedelta = timedelta(days=30)
 
 
 class CookieEntry(TypedDict, total=False):
@@ -82,8 +88,12 @@ def load_credentials() -> Credentials:
     raw = keyring.get_password(SERVICE_NAME, CREDENTIAL_KEY)
     if raw:
         try:
-            data: dict[str, Any] = json.loads(raw)
+            data: dict[str, str] = json.loads(raw)
             if data.get("email") and data.get("password"):
+                logger.debug(
+                    "Loaded credentials from keyring for email=%s",
+                    data.get("email"),
+                )
                 return Credentials(
                     email=str(data["email"]), password=str(data["password"])
                 )
@@ -93,6 +103,7 @@ def load_credentials() -> Credentials:
     email = os.environ.get("GRIBS_EMAIL")
     password = os.environ.get("GRIBS_PASSWORD")
     if email and password:
+        logger.debug("Credentials loaded from env (GRIBS_EMAIL)")
         return Credentials(email=email, password=password)
 
     raise AuthError(
@@ -103,6 +114,7 @@ def load_credentials() -> Credentials:
 
 def store_credentials(email: str, password: str) -> None:
     """Persist credentials to the OS keyring."""
+    logger.debug("Stored credentials for email=%s", email)
     payload = json.dumps({"email": email, "password": password})
     keyring.set_password(SERVICE_NAME, CREDENTIAL_KEY, payload)
 
@@ -117,7 +129,7 @@ def load_cookies() -> list[CookieEntry] | None:
     """Load cached cookies from the keyring if still fresh.
 
     Two freshness checks apply:
-    1. Cache age: `created_at` must be within `COOKIE_MAX_AGE` (5 days).
+    1. Cache age: `created_at` must be within `COOKIE_MAX_AGE` (30 days).
     2. Cookie expiry: any cookie with an `expires` field in the past causes
        the whole cache to be treated as stale (so the client re-logs in).
 

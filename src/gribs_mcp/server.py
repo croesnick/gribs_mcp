@@ -15,23 +15,30 @@ from pydantic import Field
 from gribs_mcp.client import GribsApiError, get_client
 from gribs_mcp.models import (
     CategoryNode,
+    Download,
     PostDetail,
+    PostIdRef,
     PostTeaser,
     SearchHit,
     StructureExpansion,
 )
+from gribs_mcp.parsers import parse_downloads
 
-# Category name -> category_id mapping (INTENT.md §"Sektionen (Members-Bereich)").
-# Antragsbörse=1 is verified. Other ids are TODO (INTENT.md says "zu verifizieren")
-# and therefore mapped to None to fail loudly rather than silently hit wrong data.
+# Category name -> category_id mapping.
+# Live-verified 2026-07-18 via /members/structure for each cat_id 1-24:
+# cat=1 Antragsbörse, cat=5 Arbeit im Rat, cat=6 Mitgliederbriefe,
+# cat=7 DenkWerkstatt, cat=8 Mitgliederversammlungen, cat=9 Kommunalwahl.
+# cat=2/3/4 return Antragsbörse variants (filtered views), NOT Wissenswert.
+# cat=10+ return empty navigation. Wissenswert loads asynchronously on the
+# homepage and its cat_id couldn't be mapped via the structure endpoint.
 CATEGORY_IDS: dict[str, int | None] = {
-    "Antragsbörse": 1,
-    "Wissenswert": None,  # TODO: verify cat_id (likely 2)
-    "Arbeit im Rat": None,  # TODO: verify cat_id (likely 3)
-    "Mitgliederbriefe": None,  # TODO: verify cat_id (likely 4)
-    "DenkWerkstatt": None,  # TODO: verify cat_id (likely 5)
-    "Mitgliederversammlungen": None,  # TODO: verify cat_id (likely 6)
-    "Kommunalwahl": None,  # TODO: verify cat_id (likely 7)
+    "Antragsbörse": 1,  # verified
+    "Arbeit im Rat": 5,  # verified
+    "Mitgliederbriefe": 6,  # verified
+    "DenkWerkstatt": 7,  # verified
+    "Mitgliederversammlungen": 8,  # verified
+    "Kommunalwahl": 9,  # verified
+    "Wissenswert": None,  # unverified — cat_ids 2/3/4 are Antragsbörse variants
 }
 
 DEFAULT_CATEGORY = "Antragsbörse"
@@ -41,8 +48,8 @@ MAX_CATEGORY_LIMIT = 100  # expandStructure listings
 
 INSTRUCTIONS = (
     "MCP server for gribs.net (Grünen-interne Plattform). "
-    "Tools: search_antraege, get_antrag, list_categories, "
-    "list_antraege_in_category, recent_posts. "
+    "Tools: search_antraege, get_antrag, resolve_post_id, list_categories, "
+    "list_antraege_in_category, recent_posts, extract_downloads. "
     "Quellenpflicht: jeder Antrag wird mit URL und Abrufdatum zurückgegeben. "
     "Authentication is handled automatically via cached session cookies."
 )
@@ -99,6 +106,29 @@ async def search_antraege(
         bool,
         Field(default=False, description="If true, request whole-word matches only."),
     ] = False,
+    l1: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description=(
+                "L1 sub-category id (from list_categories) to scope the search."
+            ),
+        ),
+    ] = None,
+    l2: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description="L2 sub-category id to scope the search further.",
+        ),
+    ] = None,
+    l3: Annotated[
+        int | None,
+        Field(
+            default=None,
+            description="L3 sub-category id to scope the search further.",
+        ),
+    ] = None,
     limit: Annotated[
         int,
         Field(
@@ -109,15 +139,24 @@ async def search_antraege(
 ) -> list[SearchHit]:
     """Search gribs.net posts (default: Antragsbörse).
 
+    Pass `l1`/`l2`/`l3` (from `list_categories` / `list_antraege_in_category`)
+    to scope the search to a subcategory. To list ALL posts in a subcategory,
+    use a broad query like 'a' or 'der' — gribs doesn't support an empty
+    searchstring.
+
     Args:
         query: Full-text search query.
         category: Category name (default: Antragsbörse).
         whole_word: If true, request whole-word matches.
+        l1: L1 sub-category id to scope the search (optional).
+        l2: L2 sub-category id to scope the search (optional).
+        l3: L3 sub-category id to scope the search (optional).
         limit: Maximum hits to return; clamped to [1, 50] (API cap).
 
     Returns:
         Up to `limit` SearchHit objects, each with title, snippet, wp_id, url,
-        and retrieved_at (Quellenpflicht).
+        and retrieved_at (Quellenpflicht). Use `resolve_post_id` to convert a
+        hit's `wp_id` to an internal `post_id` for `get_antrag`.
 
     Raises:
         GribsApiError: if the category is unknown or its cat_id is unverified.
@@ -130,6 +169,9 @@ async def search_antraege(
         query=query,
         category_id=category_id,
         whole_word=whole_word,
+        l1=l1,
+        l2=l2,
+        l3=l3,
     )
     return hits[:limit]
 
@@ -143,9 +185,12 @@ async def get_antrag(
     The client verifies that the parsed `post_id` matches the requested one;
     a mismatch raises `GribsApiError` (silent-wrong-post guard).
 
+    If you have a `wp_id` from `search_antraege`, call `resolve_post_id` first
+    to convert it to the internal `post_id` this tool requires.
+
     Args:
-        post_id: Internal gribs post id (as returned by list_antraege_in_category
-            or inferred from a wp_id via postWidgetFill — TODO).
+        post_id: Internal gribs post id (as returned by `recent_posts` or
+            `resolve_post_id`, NOT the `wp_id` from `search_antraege`).
 
     Returns:
         PostDetail with full body, metadata, breadcrumb, url, retrieved_at.
@@ -216,16 +261,12 @@ async def list_antraege_in_category(
     Intermediate nodes return subcategories; leaf nodes return an empty
     expansion (both `subcategories` and `posts` are None) — see the note below.
 
-    **Leaf limitation (L2)**: gribs.net's `/members/expandStructure` endpoint
-    returns a *search form* (not a post listing) when called on a leaf
-    subcategory. There is no direct "list all posts in this subcategory"
-    endpoint. To retrieve posts in a specific subcategory, use
-    `search_antraege` with a broad query — the search endpoint supports
-    scoped search via `conditions[category_level1_id]` / `[l2]` / `[l3]`
-    (the client applies these automatically when you pass `l1`/`l2`/`l3`
-    to `search_antraege`... but note: the MCP tool `search_antraege` does
-    NOT currently expose `l1`/`l2`/`l3` params. For scoped search today,
-    use the client directly or extend `search_antraege` in a follow-up).
+    **Leaf behavior**: gribs.net's `/members/expandStructure` endpoint returns
+    a *search form* (not a post listing) when called on a leaf subcategory.
+    There is no direct "list all posts in this subcategory" endpoint. To
+    retrieve posts in a specific subcategory, call `search_antraege` with the
+    same `l1`/`l2`/`l3` ids and a broad query (e.g. 'a' or 'der' — gribs
+    doesn't support an empty searchstring).
 
     Args:
         category: Category name (default: Antragsbörse).
@@ -284,6 +325,78 @@ async def recent_posts(
     return posts[:limit]
 
 
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def resolve_post_id(
+    wp_id: Annotated[
+        int,
+        Field(
+            description=(
+                "WordPress post id from a `?wp=<id>` deep link "
+                "(e.g. from search_antraege)."
+            )
+        ),
+    ],
+) -> PostIdRef:
+    """Resolve a WordPress `wp_id` to an internal gribs `post_id`.
+
+    `search_antraege` returns `wp_id`s (from `?wp=<id>` deep links), but
+    `get_antrag` requires the internal `post_id`. This tool bridges the two by
+    fetching `GET /?wp=<id>` (which redirects to the member page) and extracting
+    the embedded `post_id`.
+
+    Args:
+        wp_id: WordPress post id (from a `?wp=<id>` deep link).
+
+    Returns:
+        PostIdRef with `wp_id`, `post_id`, `url`, and `retrieved_at`
+        (Quellenpflicht). Pass `post_id` to `get_antrag`.
+
+    Raises:
+        GribsApiError: if the request fails or no `post_id` can be extracted.
+    """
+    client = get_client()
+    return await client.resolve_post_id(wp_id)
+
+
+@mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+async def extract_downloads(
+    post_id: Annotated[
+        int,
+        Field(
+            description=(
+                "Internal gribs post id (use resolve_post_id if you have a wp_id)."
+            )
+        ),
+    ],
+) -> list[Download]:
+    """Extract download links (PDFs and download-looking anchors) from a post body.
+
+    Fetches the post via `get_antrag`, then parses `body_html` for `<a href>`
+    links where the URL ends in `.pdf` (case-insensitive) OR the link text
+    mentions a download keyword (download/pdf/antrag/vorlage/beschluss/
+    musterantrag/herunterladen). Relative URLs are resolved against gribs.net.
+
+    Args:
+        post_id: Internal gribs post id.
+
+    Returns:
+        List of Download objects, each with `url`, `link_text`, `filename`,
+        `is_pdf`, `source_post_id`, `source_url`, and `retrieved_at`
+        (Quellenpflicht). May be empty if the post has no download links.
+
+    Raises:
+        GribsAuthError: if authentication fails.
+        GribsApiError: if the post cannot be fetched.
+    """
+    client = get_client()
+    post = await client.get_post(post_id)
+    return parse_downloads(
+        body_html=post.body_html,
+        post_id=post_id,
+        source_url=post.url,
+    )
+
+
 __all__ = [
     "CATEGORY_IDS",
     "DEFAULT_CATEGORY",
@@ -293,9 +406,11 @@ __all__ = [
     "MAX_SEARCH_LIMIT",
     "READ_ONLY_ANNOTATIONS",
     "mcp",
-    "recent_posts",
+    "extract_downloads",
     "get_antrag",
     "list_antraege_in_category",
     "list_categories",
+    "recent_posts",
+    "resolve_post_id",
     "search_antraege",
 ]

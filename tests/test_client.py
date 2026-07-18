@@ -697,5 +697,260 @@ class TestStaleCookiesTriggerLogin:
 _ = json
 
 
+# ---------------------------------------------------------------------------
+# resolve_post_id (Limitation 2)
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePostId:
+    async def test_resolves_wp_id_to_post_id(self, patched_keyring) -> None:
+        # Live-verified: GET /?wp=<id> redirects to /members/home/wp-<id>
+        # which contains `"post_id":"<N>"` in a JS blob.
+        member_html = (
+            '<html><script>window.__DATA__ = {"post_id":"3097"};</script></html>'
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/" and b"wp=19880" in request.url.query:
+                # Simulate the redirect landing directly (MockTransport doesn't
+                # follow redirects unless we return a 3xx + Location).
+                return httpx.Response(
+                    200,
+                    text=member_html,
+                    headers={"Content-Type": "text/html"},
+                )
+            return httpx.Response(404, text="not found")
+
+        client = _make_client(handler)
+        ref = await client.resolve_post_id(wp_id=19880)
+        assert ref.wp_id == 19880
+        assert ref.post_id == 3097
+        assert ref.url == "https://www.gribs.net/?wp=19880"
+        assert ref.retrieved_at is not None
+
+    async def test_raises_when_post_id_not_found(self, patched_keyring) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/":
+                return httpx.Response(
+                    200,
+                    text="<html><body>no post_id here</body></html>",
+                    headers={"Content-Type": "text/html"},
+                )
+            return httpx.Response(404, text="not found")
+
+        client = _make_client(handler)
+        with pytest.raises(GribsApiError, match="could not extract post_id"):
+            await client.resolve_post_id(wp_id=99999)
+
+    async def test_raises_on_http_error(self, patched_keyring) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="server error")
+
+        client = _make_client(handler)
+        with pytest.raises(GribsApiError, match="HTTP 500"):
+            await client.resolve_post_id(wp_id=19880)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent recent_posts enrichment (Limitation 4)
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentRecentPosts:
+    async def test_enrichment_is_concurrent(self, patched_keyring) -> None:
+        # 3 scaffolds -> 3 concurrent fill_post_widget calls. We observe
+        # concurrency by recording call start/end times: if enrichment were
+        # sequential, total time would be ~3x the per-call delay. With gather,
+        # all 3 fill calls are in-flight simultaneously.
+        import asyncio as _asyncio
+        import time
+
+        recent_html = (
+            "<div class='startpage-recent'>"
+            "<div class='post-widget' id='601_pid'>"
+            "<script>postWidget(601,'601_pid','start');</script></div>"
+            "<div class='post-widget' id='602_pid'>"
+            "<script>postWidget(602,'602_pid','start');</script></div>"
+            "<div class='post-widget' id='603_pid'>"
+            "<script>postWidget(603,'603_pid','start');</script></div>"
+            "</div>"
+        )
+
+        fill_call_count = 0
+        fill_call_starts: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal fill_call_count
+            if request.url.path == "/post/recentposts":
+                return httpx.Response(
+                    200, text=recent_html, headers={"Content-Type": "text/html"}
+                )
+            if request.url.path == "/members/postWidgetFill":
+                fill_call_count += 1
+                fill_call_starts.append(time.monotonic())
+                widget_html = (
+                    f"<div class='pwidget-title' title='Post {fill_call_count}'>"
+                    f"Post {fill_call_count}</div>"
+                )
+                return httpx.Response(
+                    200, text=widget_html, headers={"Content-Type": "text/html"}
+                )
+            return httpx.Response(404, text="not found")
+
+        client = _make_client(handler)
+        # Monkey-patch fill_post_widget to add a small delay so concurrency
+        # is observable via timing. The gather pattern means all 3 calls
+        # start before any finish.
+        original_fill = client.fill_post_widget
+
+        async def _slow_fill(post_id: int, caller: str = "start") -> str:
+            await _asyncio.sleep(0.05)
+            return await original_fill(post_id, caller)
+
+        client.fill_post_widget = _slow_fill  # type: ignore[method-assign]
+
+        start = time.monotonic()
+        posts = await client.recent_posts()
+        elapsed = time.monotonic() - start
+
+        assert len(posts) == 3
+        assert fill_call_count == 3
+        # If sequential: 3 * 0.05 = 0.15s minimum. With gather: ~0.05s.
+        # Allow generous slack for CI; the key assertion is that it's
+        # significantly faster than sequential.
+        assert elapsed < 0.12, (
+            f"enrichment appears sequential (elapsed={elapsed:.3f}s, "
+            "expected <0.12s for concurrent 3x0.05s)"
+        )
+        # All 3 fill calls started within a small window (concurrency check):
+        # the difference between the first and last start should be tiny.
+        if len(fill_call_starts) >= 2:
+            spread = max(fill_call_starts) - min(fill_call_starts)
+            assert spread < 0.02, (
+                f"fill calls started too far apart (spread={spread:.3f}s, "
+                "expected <0.02s for concurrent dispatch)"
+            )
+
+    async def test_preserves_scaffold_order(self, patched_keyring) -> None:
+        # asyncio.gather preserves ordering: results come back in the same
+        # order as the input scaffolds, regardless of completion order.
+        recent_html = (
+            "<div class='startpage-recent'>"
+            "<div class='post-widget' id='701_pid'>"
+            "<script>postWidget(701,'701_pid','start');</script></div>"
+            "<div class='post-widget' id='702_pid'>"
+            "<script>postWidget(702,'702_pid','start');</script></div>"
+            "<div class='post-widget' id='703_pid'>"
+            "<script>postWidget(703,'703_pid','start');</script></div>"
+            "</div>"
+        )
+
+        # Make the middle post's fill respond slowest to verify ordering
+        # is by scaffold position, not completion time.
+        import asyncio as _asyncio
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/post/recentposts":
+                return httpx.Response(
+                    200, text=recent_html, headers={"Content-Type": "text/html"}
+                )
+            if request.url.path == "/members/postWidgetFill":
+                post_id = request.read().decode().split("post_id=")[1].split("&")[0]
+                # Middle post is slowest.
+                widget_html = (
+                    f"<div class='pwidget-title' title='Post {post_id}'>"
+                    f"Post {post_id}</div>"
+                )
+                return httpx.Response(
+                    200,
+                    text=widget_html,
+                    headers={"Content-Type": "text/html"},
+                )
+            return httpx.Response(404, text="not found")
+
+        client = _make_client(handler)
+        original_fill = client.fill_post_widget
+
+        async def _variable_fill(post_id: int, caller: str = "start") -> str:
+            if post_id == 702:
+                await _asyncio.sleep(0.03)  # middle is slowest
+            return await original_fill(post_id, caller)
+
+        client.fill_post_widget = _variable_fill  # type: ignore[method-assign]
+
+        posts = await client.recent_posts()
+        assert [p.post_id for p in posts] == [701, 702, 703]
+        assert [p.title for p in posts] == ["Post 701", "Post 702", "Post 703"]
+
+
+# ---------------------------------------------------------------------------
+# Logging (caplog tests — verify sensitive data isn't logged)
+# ---------------------------------------------------------------------------
+
+
+class TestLogging:
+    """Verify logging calls fire at the right levels without leaking secrets."""
+
+    async def test_login_success_logs_email_not_password(
+        self, patched_keyring, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        handler = _set_cookie_handler()
+        client = _make_client(handler)
+        with caplog.at_level(_logging.INFO, logger="gribs_mcp.client"):
+            await client.login()
+        # The success log should mention the email.
+        assert any("tester@example.org" in r.message for r in caplog.records)
+        # The password must NEVER appear in any log record.
+        assert "hunter2" not in caplog.text
+
+    async def test_401_retry_logs_relogin(
+        self, patched_keyring, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if request.url.path == "/users/ajax_login":
+                return httpx.Response(
+                    200,
+                    text="1",
+                    headers={"Set-Cookie": "PHPSESSID=x; Path=/"},
+                )
+            if request.url.path == "/members/structure":
+                if call_count == 1:
+                    return httpx.Response(401, text="unauthorized")
+                return httpx.Response(
+                    200,
+                    json={
+                        "error": False,
+                        "navigation": "",
+                        "content": "",
+                        "properties": "",
+                    },
+                )
+            return httpx.Response(404, text="not found")
+
+        client = _make_client(handler)
+        assert client._client is not None
+        client._client.cookies.set("PHPSESSID", "stale", domain="www.gribs.net")
+        patched_keyring.append(
+            {
+                "name": "PHPSESSID",
+                "value": "stale",
+                "domain": "www.gribs.net",
+                "path": "/",
+            }
+        )
+        with caplog.at_level(_logging.INFO, logger="gribs_mcp.client"):
+            await client.list_categories(category_id=1)
+        # The 401 retry should log an INFO message about re-logging in.
+        assert any("re-logging in" in r.message for r in caplog.records)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

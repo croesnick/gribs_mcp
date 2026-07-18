@@ -7,7 +7,7 @@ Every model returning politically relevant data includes `url` and `retrieved_at
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +15,59 @@ from pydantic import BaseModel, ConfigDict, Field
 def _utcnow() -> datetime:
     """Return current UTC time (tz-aware)."""
     return datetime.now(UTC)
+
+
+# ---------------------------------------------------------------------------
+# TypedDict contracts for gribs.net API responses (internal, not public schema)
+# ---------------------------------------------------------------------------
+
+
+class _GribsApiResponse(TypedDict, total=False):
+    """Common envelope for `/members/*` JSON endpoints.
+
+    All `/members/*` endpoints return `{error, ...}` where `error` is falsy
+    on success. The payload-carrying keys vary per endpoint; the per-endpoint
+    TypedDicts below declare exactly the keys each endpoint returns.
+    """
+
+    error: str | bool | None
+
+
+class SinglepostResponse(_GribsApiResponse, total=False):
+    """Response shape for `/members/singlepost`.
+
+    `content` carries the post body HTML, `header` the category banner, and
+    `views` the recently-viewed list (whose first `inlinelink({...})` carries
+    the canonical `post_id`).
+    """
+
+    content: str | bool
+    header: str
+    views: str
+
+
+class StructureResponse(_GribsApiResponse, total=False):
+    """Response shape for `/members/structure`.
+
+    The category tree lives in `navigation` (NOT `content`, which holds
+    landing-page widgets).
+    """
+
+    navigation: str | bool
+    content: str | bool
+    properties: str
+
+
+class ExpandStructureResponse(_GribsApiResponse, total=False):
+    """Response shape for `/members/expandStructure`.
+
+    Intermediate nodes: `structure` has subcategory HTML, `content` is false.
+    Leaf nodes: `content` has a search form (NOT posts), `structure` is false.
+    """
+
+    options: str
+    structure: str | bool
+    content: str | bool
 
 
 class GribsError(BaseModel):
@@ -155,11 +208,84 @@ class StructureExpansion(BaseModel):
     ]
 
 
+class PostIdRef(BaseModel):
+    """Result of resolving a WordPress `wp_id` to an internal `post_id`.
+
+    Returned by `resolve_post_id`. Carries `url` + `retrieved_at`
+    (Quellenpflicht) so callers can cite where the resolution came from.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    wp_id: Annotated[
+        int, Field(description="WordPress post id (from `?wp=<id>` deep links).")
+    ]
+    post_id: Annotated[
+        int,
+        Field(
+            description=(
+                "Internal gribs post id (usable with `/members/singlepost` "
+                "and `get_antrag`)."
+            )
+        ),
+    ]
+    url: Annotated[
+        str,
+        Field(description="The `?wp=<id>` deep-link URL that was resolved."),
+    ]
+    retrieved_at: Annotated[
+        datetime, Field(description="UTC timestamp when the resolution was performed.")
+    ]
+
+
+class Download(BaseModel):
+    """A downloadable file (typically a PDF) extracted from a post body.
+
+    Returned by `extract_downloads`. Carries `source_url` + `retrieved_at`
+    (Quellenpflicht) so the download can be cited back to its origin post.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    url: Annotated[
+        str,
+        Field(
+            description=(
+                "Absolute download URL (relative URLs resolved against gribs.net)."
+            )
+        ),
+    ]
+    link_text: Annotated[str, Field(description="Anchor text of the download link.")]
+    filename: Annotated[
+        str | None,
+        Field(description="Filename extracted from the URL path, if present."),
+    ]
+    is_pdf: Annotated[
+        bool,
+        Field(description="True if the URL path ends in `.pdf` (case-insensitive)."),
+    ]
+    source_post_id: Annotated[
+        int, Field(description="post_id of the post this download was extracted from.")
+    ]
+    source_url: Annotated[
+        str,
+        Field(description="Canonical URL of the source post (Quellenpflicht)."),
+    ]
+    retrieved_at: Annotated[
+        datetime, Field(description="UTC timestamp when the download was extracted.")
+    ]
+
+
 __all__ = [
     "CategoryNode",
+    "Download",
+    "ExpandStructureResponse",
     "GribsError",
     "PostDetail",
+    "PostIdRef",
     "PostTeaser",
     "SearchHit",
+    "SinglepostResponse",
     "StructureExpansion",
+    "StructureResponse",
 ]
