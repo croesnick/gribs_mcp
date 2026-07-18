@@ -49,6 +49,16 @@ def singlepost_response_json() -> dict[str, Any]:
 
 
 @pytest.fixture
+def singlepost_stale_views_json() -> dict[str, Any]:
+    """Regression fixture (Issue #11): content carries post_id 3102 (via
+    `data-heart`, `id="hashfield_3102"`, `postWidget(3102, 'share')`), but the
+    `views` field carries a STALE `post_id:2492` from a previously-viewed post.
+    `parse_singlepost` must return `post_id == 3102`, NOT 2492.
+    """
+    return _read_json("singlepost_stale_views.json")
+
+
+@pytest.fixture
 def singlepost_html() -> str:
     """HTML content from the `content` field of `/members/singlepost`."""
     return _read_json("singlepost_response.json")["content"]

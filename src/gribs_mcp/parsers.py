@@ -60,6 +60,19 @@ _HASHFIELD_RE = re.compile(
     r'id="hashfield_\d+"[^>]*value="https://www\.gribs\.net/\?h=([0-9a-fA-F]+)"'
 )
 
+# `<i class="bi bi-heart" data-heartwp="..." data-heart="<N>" ...>` — the
+# favorite-toggle icon in singlepost content. `data-heart` carries the
+# post_id of the post currently being rendered (NOT the session-global
+# `views` history, which is stale and unreliable). The negative lookahead
+# ensures we don't match `data-heartwp="..."` (the wp_id sibling attribute).
+# Matches the verified-live double-quoted attribute format.
+_HEART_DATA_RE = re.compile(r'data-heart(?!wp)="(\d+)"')
+
+# `<input id="hashfield_<N>" ...>` — captures the post_id embedded in the
+# share-hash field's element id. Separate from `_HASHFIELD_RE` (which captures
+# the share HASH, not the id).
+_HASHFIELD_ID_RE = re.compile(r'id="hashfield_(\d+)"')
+
 # `inlinelink({...})` — the object body is HTML-entity-encoded in live
 # responses (`{&quot;cat&quot;:1,&quot;post_id&quot;:3102}`).
 _INLINELINK_RE = re.compile(r"inlinelink\(\s*(\{[^}]*\})\s*\)", re.DOTALL)
@@ -198,12 +211,30 @@ def _extract_share_hash(content_html: str | None) -> str | None:
     return _first_str(_HASH_RE, content_html)
 
 
+def _extract_post_id_from_content_heart(content_html: str | None) -> int | None:
+    """Extract post_id from the `<i class="bi bi-heart" data-heart="<N>">` tag.
+
+    This is the canonical post_id source for the post currently being rendered.
+    Unlike `views`, `data-heart` is bound to the rendered post, not to the
+    session-global "recently viewed" history (which is stale and unreliable).
+    """
+    return _first_int(_HEART_DATA_RE, content_html)
+
+
+def _extract_post_id_from_hashfield(content_html: str | None) -> int | None:
+    """Extract post_id from `<input id="hashfield_<N>" ...>` in singlepost content.
+
+    Secondary fallback when the `data-heart` attribute is absent.
+    """
+    return _first_int(_HASHFIELD_ID_RE, content_html)
+
+
 def _infer_post_id_from_content(content_html: str | None) -> int | None:
     """Best-effort: extract post_id from a `postWidget(<id>, ...)` call.
 
-    Returns None if no match is found. The canonical post_id lives in the
-    `views` field (see :func:`_extract_post_id_from_views`); this helper is a
-    fallback for responses missing `views`.
+    Returns None if no match is found. This is the last-resort fallback for
+    responses missing both the `data-heart` attribute and the
+    `id="hashfield_<N>"` field (e.g. some older fixture formats).
     """
     if not isinstance(content_html, str):
         return None
@@ -647,19 +678,31 @@ def parse_singlepost(json_response: Mapping[str, Any]) -> PostDetail:
 
     The verified-live response has four string keys (all HTML except `error`):
     - `content`: post body HTML with `.posts-title`, `.posts-date`,
-      `<span class="post-view-count">N</span>`, and the
-      `<input id="hashfield_<id>" value="...?h=<hash>">` share field.
+      `<span class="post-view-count">N</span>`, the
+      `<input id="hashfield_<id>" value="...?h=<hash>">` share field, and a
+      `<i class="bi bi-heart" data-heartwp="..." data-heart="<id>" ...>`
+      favorite-toggle icon.
     - `header`: category banner with `<h1 class="member-banner-title">…</h1>`.
-    - `views`: HTML list of recently-viewed favorites; the first
-      `inlinelink({cat, l1, l2, l3, post_id})` carries THIS post's canonical
-      post_id and full category path.
+    - `views`: HTML list of recently-viewed favorites. This is a
+      SESSION-GLOBAL "recently viewed" widget and is NOT a reliable
+      post_id source (the server updates it lazily, so after fetching post A,
+      every subsequent fetch inherits A's stale `views[0].post_id`). It is
+      used ONLY for category-path breadcrumb enrichment
+      (see :func:`_extract_category_path_from_views`).
+
+    post_id extraction order (most-reliable first):
+      1. `data-heart="<N>"` on the `<i class="bi bi-heart">` tag in `content`
+         (bound to the rendered post).
+      2. `id="hashfield_<N>"` on the share-hash input in `content`.
+      3. `postWidget(<N>, ...)` call in `content` (legacy/older fixture format).
+    `views` is intentionally NOT consulted for post_id.
 
     Args:
         json_response: Parsed JSON dict from the API.
 
     Returns:
         PostDetail with all fields populated where extractable. `post_id`
-        is None if inference from both `content` and `views` fails.
+        is None if inference from `content` fails (all three signals absent).
     """
     content = json_response.get("content", "")
     if not isinstance(content, str):
@@ -671,11 +714,16 @@ def parse_singlepost(json_response: Mapping[str, Any]) -> PostDetail:
     if not isinstance(views, str):
         views = ""
 
-    # post_id: prefer the canonical id from `views` (inlinelink); fall back to
-    # the postWidget() call in `content`.
-    post_id = _extract_post_id_from_views(views)
+    # post_id: prefer the bound-to-rendered-post `data-heart` attribute, then
+    # the `hashfield_<id>` input, then the legacy `postWidget(<id>)` call.
+    # `views` is intentionally excluded — it's a session-global "recently
+    # viewed" list, lazily updated, and carries a STALE post_id (Issue #11).
+    post_id = _extract_post_id_from_content_heart(content)
     if post_id is None:
-        logger.debug("post_id from views failed; falling back to content postWidget()")
+        logger.debug("post_id from data-heart failed; falling back to hashfield id")
+        post_id = _extract_post_id_from_hashfield(content)
+    if post_id is None:
+        logger.debug("post_id from hashfield id failed; falling back to postWidget()")
         post_id = _infer_post_id_from_content(content)
 
     tree = HTMLParser(content)
