@@ -1,0 +1,46 @@
+# Dependabot configuration for gribs_mcp.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Rationale:
+# - `pip` ecosystem handles pyproject.toml + uv.lock (Dependabot learned to
+#   parse uv.lock in late 2024). Weekly cadence matches the project's cadence
+#   (no CI to break on a daily churn). Minor+patch are grouped to cut PR noise;
+#   majors stay individual so breaking changes get explicit review.
+# - `github-actions` ecosystem future-proofs .github/workflows/ (none exist
+#   yet, but Dependabot will pick them up as soon as they're added). Monthly
+#   cadence is plenty for action version bumps.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      python-minor:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "github-actions"

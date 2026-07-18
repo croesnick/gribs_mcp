@@ -1,0 +1,22 @@
+# Credentials & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# venvs
+.venv/
+
+# Caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Playwright (defensive — currently unused, no Playwright dependency)
+playwright_data/
+.playwright-mcp/

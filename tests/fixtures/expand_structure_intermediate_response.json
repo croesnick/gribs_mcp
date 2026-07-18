@@ -1,0 +1,7 @@
+{
+  "error": false,
+  "options": "<div class=\"struct-options\"></div>",
+  "header": "<div class=\"struct-header\"><h2>Umwelt</h2></div>",
+  "structure": "<div class=\"menu-struct\"><div id=\"m_l2_115\" class=\"menu-struct-label\" onclick=\"structexp(&#039;m_l2_115&#039;,{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,&quot;l2&quot;:&quot;115&quot;},&#039;1_7_115&#039;,&#039;l2&#039;,&#039;load&#039;);\">Abfall</div><div id=\"m_l2_120\" class=\"menu-struct-label\" onclick=\"structexp(&#039;m_l2_120&#039;,{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,&quot;l2&quot;:&quot;120&quot;},&#039;1_7_120&#039;,&#039;l2&#039;,&#039;load&#039;);\">Artenschutz</div><div id=\"m_l2_125\" class=\"menu-struct-label\" onclick=\"structexp(&#039;m_l2_125&#039;,{&quot;cat&quot;:&quot;1&quot;,&quot;l1&quot;:&quot;7&quot;,&quot;l2&quot;:&quot;125&quot;},&#039;1_7_125&#039;,&#039;l2&#039;,&#039;load&#039;);\">Wasser</div></div>",
+  "content": false
+}

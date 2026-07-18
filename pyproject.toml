@@ -1,0 +1,52 @@
+[project]
+name = "gribs-mcp"
+version = "0.1.0"
+description = "MCP server for gribs.net: Antragsbörse, Vorlagenpool, Dateibereich"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.28.1",
+    "httpx>=0.27.0",
+    "pydantic>=2.13.4",
+    "selectolax>=0.3.21",
+    "trafilatura>=1.12.0",
+    "keyring>=25.0.0",
+]
+
+[project.scripts]
+gribs-mcp = "gribs_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gribs_mcp"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.21",
+    "mypy>=2.3.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = ["trafilatura.*", "selectolax.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
