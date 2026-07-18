@@ -12,6 +12,7 @@ import html
 import json
 import logging
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -26,7 +27,6 @@ from gribs_mcp.models import (
     PostDetail,
     PostTeaser,
     SearchHit,
-    SinglepostResponse,
     StructureExpansion,
 )
 
@@ -94,7 +94,7 @@ _DOWNLOAD_KEYWORDS = (
 
 
 # ---------------------------------------------------------------------------
-# Small extraction helpers (single-responsity, ~1-3 lines each)
+# Small extraction helpers (single-responsibility, ~1-3 lines each)
 # ---------------------------------------------------------------------------
 
 
@@ -124,16 +124,25 @@ def _first_str(pattern: re.Pattern[str], text: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def _gribs_url(
-    post_id: int | None = None,  # noqa: ARG001 — kept for API stability
-    wp_id: int | None = None,
-    hash_: str | None = None,
-) -> str:
+def _as_int(v: Any) -> int | None:
+    """Coerce a value to int, returning None on failure or None input."""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gribs_url(wp_id: int | None = None, hash_: str | None = None) -> str:
     """Build a canonical gribs.net deep-link URL.
 
     Prefers hash > wp_id (per INTENT.md §ID-Dualität). When neither is known,
     falls back to the members landing page — gribs.net has no `?p=<post_id>`
-    deep-link, so fabricating one would yield a broken URL.
+    deep-link, so fabricating one would yield a broken URL. All teasers without
+    a known hash or wp_id therefore share `MEMBERS_LANDING_URL` (known
+    limitation: deep-link resolution requires a follow-up `postWidgetFill` /
+    member-page lookup).
     """
     if hash_:
         return f"https://www.gribs.net/?h={hash_}"
@@ -291,14 +300,6 @@ def _extract_category_path_from_views(views_html: str) -> dict[str, int | None]:
     if obj is None:
         return {"cat": None, "l1": None, "l2": None, "l3": None}
 
-    def _as_int(v: Any) -> int | None:
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
     return {
         "cat": _as_int(obj.get("cat")),
         "l1": _as_int(obj.get("l1")),
@@ -348,18 +349,12 @@ def _parse_structexp_args(
     if not onclick:
         return None
 
-    def _as_int(v: Any) -> int | None:
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
     # Primary: verified-live object format.
     obj = _parse_js_object(onclick, _STRUCTEXP_RE)
     if obj is not None:
-        cat = _as_int(obj.get("cat")) or 0
+        cat = _as_int(obj.get("cat"))
+        if cat is None:
+            cat = 0
         l1 = _as_int(obj.get("l1"))
         l2 = _as_int(obj.get("l2"))
         l3 = _as_int(obj.get("l3"))
@@ -633,22 +628,21 @@ def _extract_singlepost_breadcrumb(tree: HTMLParser, header: str) -> list[str]:
 
     Prefers the `.member-banner-title` from the `header` field (top-level
     category name), then appends any `.breadcrumb` list items from `content`.
-    De-duplicates the banner title if it's already the first breadcrumb entry.
+    De-duplicates the banner title if it's already the first breadcrumb entry
+    (only the leading duplicate is removed — deeper path is preserved).
     """
     breadcrumb: list[str] = []
     banner_title = _extract_banner_title(header)
     if banner_title:
         breadcrumb.append(banner_title)
     content_breadcrumb = _parse_breadcrumb(tree)
-    if content_breadcrumb and (
-        not breadcrumb or breadcrumb[0] != content_breadcrumb[0]
-    ):
-        # Avoid duplicating the banner title if it's already the first entry.
-        breadcrumb.extend(content_breadcrumb)
+    if content_breadcrumb:
+        start = 1 if breadcrumb and breadcrumb[0] == content_breadcrumb[0] else 0
+        breadcrumb.extend(content_breadcrumb[start:])
     return breadcrumb
 
 
-def parse_singlepost(json_response: SinglepostResponse) -> PostDetail:
+def parse_singlepost(json_response: Mapping[str, Any]) -> PostDetail:
     """Parse `/members/singlepost` JSON response into PostDetail.
 
     The verified-live response has four string keys (all HTML except `error`):
@@ -696,7 +690,7 @@ def parse_singlepost(json_response: SinglepostResponse) -> PostDetail:
         category_breadcrumb=_extract_singlepost_breadcrumb(tree, header),
         body_html=body_html,
         body_text=_extract_body_text(body_html),
-        url=_extract_singlepost_share_url(content) or _gribs_url(post_id=post_id),
+        url=_extract_singlepost_share_url(content) or _gribs_url(),
         retrieved_at=_utcnow(),
     )
 
@@ -760,8 +754,10 @@ def parse_expand_structure(html: str) -> StructureExpansion:
     """Parse `/members/expandStructure` HTML into either subcategories or posts.
 
     - Intermediate nodes return a list of `.menu-struct-label` subcategories.
-    - Leaf nodes return a list of `.post-widget` containers with `post_id`
-      extractable from `postWidget(post_id, ...)` calls.
+    - Leaf nodes: the verified-live response returns a *search form* (NOT posts).
+      The `.post-widget` container handling below is a legacy fallback for older
+      response formats and is retained defensively; live leaf responses will
+      fall through to the empty-subcategories branch.
 
     Args:
         html: HTML snippet returned in the `content` field of the JSON response.
@@ -809,7 +805,7 @@ def parse_expand_structure(html: str) -> StructureExpansion:
                     title=title or f"Post {post_id}",
                     date=date,
                     snippet=snippet,
-                    url=_gribs_url(post_id=post_id),
+                    url=_gribs_url(),
                     retrieved_at=now,
                 )
             )
@@ -912,7 +908,7 @@ def parse_recent_posts(html: str) -> list[PostTeaser]:
                 snippet=snippet or None,
                 # Only post_id is known here; gribs.net has no ?p= deep-link,
                 # so fall back to the members landing page.
-                url=_gribs_url(post_id=post_id),
+                url=_gribs_url(),
                 retrieved_at=now,
             )
         )
@@ -965,7 +961,7 @@ def parse_post_widget(html: str, post_id: int) -> PostTeaser:
         title=title or f"Post {post_id}",
         date=date,
         snippet=None,  # postWidgetFill doesn't return a snippet.
-        url=_gribs_url(post_id=post_id),
+        url=_gribs_url(),
         retrieved_at=now,
     )
 
@@ -1040,6 +1036,9 @@ def parse_downloads(
         downloads.append(
             Download(
                 url=resolved,
+                # Fallback chain: prefer anchor text, then filename from URL path,
+                # finally the resolved URL itself (so link_text is always
+                # non-empty even for image-only or unnamed anchors).
                 link_text=link_text or filename or resolved,
                 filename=filename,
                 is_pdf=is_pdf,
@@ -1060,7 +1059,7 @@ def parse_downloads(
 # ---------------------------------------------------------------------------
 
 
-async def parse_singlepost_async(json_response: SinglepostResponse) -> PostDetail:
+async def parse_singlepost_async(json_response: Mapping[str, Any]) -> PostDetail:
     """Wrap parse_singlepost for callers wanting to offload trafilatura's blocking work.
 
     trafilatura is CPU-bound and synchronous. Use this in client code that runs

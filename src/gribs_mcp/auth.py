@@ -25,7 +25,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import keyring
 
@@ -88,7 +88,7 @@ def load_credentials() -> Credentials:
     raw = keyring.get_password(SERVICE_NAME, CREDENTIAL_KEY)
     if raw:
         try:
-            data: dict[str, str] = json.loads(raw)
+            data: dict[str, Any] = json.loads(raw)
             if data.get("email") and data.get("password"):
                 logger.debug(
                     "Loaded credentials from keyring for email=%s",

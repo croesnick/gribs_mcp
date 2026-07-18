@@ -20,30 +20,26 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 import httpx
 
-from gribs_mcp import auth, parsers
+from gribs_mcp import __version__, auth, parsers
 from gribs_mcp.auth import AuthError, CookieEntry
 from gribs_mcp.models import (
     CategoryNode,
-    ExpandStructureResponse,
     PostDetail,
     PostIdRef,
     PostTeaser,
     SearchHit,
-    SinglepostResponse,
     StructureExpansion,
-    StructureResponse,
-    _GribsApiResponse,
 )
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.gribs.net"
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
-USER_AGENT = "gribs-mcp/0.1 (+https://www.gribs.net/)"
+USER_AGENT = f"gribs-mcp/{__version__} (+https://github.com/croesnick/gribs_mcp)"
 
 
 def _utcnow() -> datetime:
@@ -86,6 +82,14 @@ def _looks_like_success(body: Any) -> bool:
     return False
 
 
+def _truncate(s: Any, limit: int = 200) -> str:
+    """Truncate a value's repr to `limit` chars for safe logging/errors."""
+    text = repr(s) if not isinstance(s, str) else s
+    if len(text) > limit:
+        return text[:limit] + "...(truncated)"
+    return text
+
+
 class GribsAuthError(AuthError):
     """Raised when login fails or credentials are missing.
 
@@ -112,6 +116,11 @@ class GribsClient:
         self._credentials: auth.Credentials | None = None
         # Serializes re-login attempts so concurrent 401s don't trigger N logins.
         self._login_lock = asyncio.Lock()
+        # Bumped each time a successful re-login completes inside
+        # `_request_with_retry`. Concurrent waiters capture the value before
+        # acquiring the lock; if it changed by the time they get the lock,
+        # another waiter already re-logged in and they can skip `login()`.
+        self._relogin_generation = 0
 
     async def __aenter__(self) -> GribsClient:
         await self._ensure_client()
@@ -206,7 +215,7 @@ class GribsClient:
         entries = _serialize_cookies(client.cookies)
         auth.store_cookies(entries)
         self._credentials = auth.Credentials(email=email, password=password)
-        logger.info(
+        logger.debug(
             "Login successful for email=%s; cached %d cookies",
             email,
             len(entries),
@@ -229,16 +238,20 @@ class GribsClient:
         if isinstance(body, dict):
             err = body.get("error")
             if err not in (None, False, "false", 0, "0"):
-                logger.warning("Login rejected for email=%s: %s", email, body)
-                raise GribsAuthError(f"Login rejected: {body}")
+                logger.warning(
+                    "Login rejected for email=%s: body=%s", email, _truncate(body)
+                )
+                raise GribsAuthError(f"Login rejected: body={_truncate(body)}")
 
         if not cookie_set and not _looks_like_success(body):
             logger.warning(
-                "Login did not set session cookie for email=%s (body=%r)",
+                "Login did not set session cookie for email=%s (body=%s)",
                 email,
-                body,
+                _truncate(body),
             )
-            raise GribsAuthError(f"Login did not set a session cookie (body={body!r})")
+            raise GribsAuthError(
+                f"Login did not set a session cookie (body={_truncate(body)})"
+            )
 
     async def ensure_session(self) -> None:
         """Ensure we have a fresh logged-in session.
@@ -282,21 +295,50 @@ class GribsClient:
 
         if resp.status_code in (401, 403) and allow_relogin:
             logger.info("Got HTTP %d on %s; re-logging in", resp.status_code, endpoint)
-            # Serialize re-login so concurrent 401s don't trigger N parallel
-            # login attempts. We deleted cookies above so this login is fresh;
-            # concurrent waiters on `_login_lock` will also call login() —
-            # acceptable because login is idempotent (gribs re-issues the same
-            # session cookie for the same credentials).
+            # Serialize the re-login decision so concurrent 401s collapse to a
+            # single login. Capture the relogin generation BEFORE acquiring
+            # the lock; if it changed by the time we get the lock, another
+            # waiter already re-logged in and we can skip `login()` entirely.
+            # N concurrent 401s therefore result in 1 login, not N.
+            my_generation = self._relogin_generation
             async with self._login_lock:
-                # Clear the rejected cookies from both the keyring cache and
-                # the live jar. `load_cookies()` freshness checks (age/expiry)
-                # don't catch server-side revocation, so we force-clear here.
-                auth.delete_cookies()
-                client.cookies.clear()
-                try:
-                    await self.login()
-                except GribsAuthError as exc:
-                    raise GribsAuthError(f"Re-login failed: {exc}") from exc
+                if self._relogin_generation == my_generation:
+                    # No waiter has re-logged in since we got our 401 — we're
+                    # the one that logs in. Clear the rejected cookies from
+                    # both the keyring cache and the live jar.
+                    # `load_cookies()` freshness checks (age/expiry) don't
+                    # catch server-side revocation, so we force-clear here.
+                    auth.delete_cookies()
+                    client.cookies.clear()
+                    try:
+                        await self.login()
+                    except GribsAuthError as exc:
+                        raise GribsAuthError(f"Re-login failed: {exc}") from exc
+                    self._relogin_generation += 1
+                else:
+                    # Another waiter already re-logged in; hydrate our jar
+                    # from the fresh cache so the retry POST carries valid
+                    # cookies.
+                    cached = auth.load_cookies() or []
+                    client.cookies.clear()
+                    for entry in cached:
+                        name = entry.get("name")
+                        value = entry.get("value")
+                        if not name or not value:
+                            continue
+                        client.cookies.set(
+                            name=name,
+                            value=value,
+                            domain=entry.get("domain") or "www.gribs.net",
+                            path=entry.get("path") or "/",
+                        )
+                    logger.debug(
+                        "Re-login already performed by another waiter; "
+                        "hydrated %d cookies for retry",
+                        len(cached),
+                    )
+            # Retry POST outside the lock so concurrent retries don't
+            # serialize.
             resp = await client.post(endpoint, data=data, headers=headers)
 
         if resp.status_code >= 400:
@@ -311,7 +353,7 @@ class GribsClient:
         data: dict[str, Any],
         *,
         allow_relogin: bool = True,
-    ) -> _GribsApiResponse:
+    ) -> dict[str, Any]:
         """POST and return parsed JSON dict, with auth retry.
 
         Raises:
@@ -335,7 +377,7 @@ class GribsClient:
         if payload.get("error") not in (None, False, "false", 0, "0"):
             raise GribsApiError(f"POST {endpoint} -> API error: {payload}")
 
-        return payload  # type: ignore[return-value]
+        return payload
 
     async def _post_form_html(
         self,
@@ -418,11 +460,8 @@ class GribsClient:
                 `post_id` (silent-wrong-post guard, see Oracle C3).
         """
         await self.ensure_session()
-        payload = cast(
-            SinglepostResponse,
-            await self._post_form_json(
-                "/members/singlepost", {"post_id": str(post_id)}
-            ),
+        payload = await self._post_form_json(
+            "/members/singlepost", {"post_id": str(post_id)}
         )
         post = await parsers.parse_singlepost_async(payload)
         # Guard against silent wrong-post fetches: if we couldn't confirm the
@@ -463,10 +502,7 @@ class GribsClient:
             "type": "load",
             "sort": "false",
         }
-        payload = cast(
-            StructureResponse,
-            await self._post_form_json("/members/structure", data),
-        )
+        payload = await self._post_form_json("/members/structure", data)
         navigation = payload.get("navigation", "")
         if not isinstance(navigation, str):
             return CategoryNode(id=category_id, label=root_label, children=[])
@@ -518,10 +554,7 @@ class GribsClient:
                 data["obj[l2]"] = str(l2)
             if l3 is not None:
                 data["obj[l3]"] = str(l3)
-        payload = cast(
-            ExpandStructureResponse,
-            await self._post_form_json("/members/expandStructure", data),
-        )
+        payload = await self._post_form_json("/members/expandStructure", data)
 
         # Intermediate nodes carry subcategories in `structure`.
         structure = payload.get("structure", "")
@@ -633,9 +666,15 @@ class GribsClient:
                 return await asyncio.to_thread(
                     parsers.parse_post_widget, widget_html, scaffold.post_id
                 )
-            except (GribsApiError, httpx.HTTPError):
+            except (GribsApiError, httpx.HTTPError) as exc:
                 # If enrichment fails for one post, keep the scaffold (title
-                # will be "Post <id>") rather than dropping it entirely.
+                # will be "Post <id>") rather than dropping it entirely. Surface
+                # the failure in logs so the degradation isn't silent — a
+                # caller seeing placeholder titles can correlate via this
+                # warning.
+                logger.warning(
+                    "Enrichment failed for post_id=%d: %s", scaffold.post_id, exc
+                )
                 return scaffold
 
         # Concurrent enrichment — all fill_post_widget calls fire in parallel.

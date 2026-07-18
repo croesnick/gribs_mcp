@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from selectolax.parser import HTMLParser
 
 from gribs_mcp.parsers import (
+    _extract_singlepost_breadcrumb,
     parse_downloads,
     parse_expand_structure,
     parse_post_id_from_member_page,
@@ -278,6 +280,57 @@ class TestParseSinglepost:
         post = parse_singlepost(payload)
         assert post.url == "https://www.gribs.net/members/home"
         assert post.post_id == 42
+
+
+class TestBreadcrumbDedup:
+    """Regression tests for `_extract_singlepost_breadcrumb` (Issue #1).
+
+    When the banner title from `header` collides with the first entry of the
+    `content` `.breadcrumb` list, only the leading duplicate must be removed —
+    the deeper L1/L2/L3 path is preserved. (Previously the entire
+    content_breadcrumb was dropped on collision.)
+    """
+
+    def test_banner_collision_preserves_deeper_path(self) -> None:
+        # Banner title "Umwelt" collides with the first breadcrumb entry.
+        # Result must keep the full deeper path, not drop it.
+        header = "<h1 class='member-banner-title'>Umwelt</h1>"
+        content = (
+            "<nav>"
+            "<ol class='breadcrumb'>"
+            "<li>Umwelt</li>"
+            "<li>Wasser</li>"
+            "<li>Trinkwasser</li>"
+            "</ol>"
+            "</nav>"
+        )
+        tree = HTMLParser(content)
+        breadcrumb = _extract_singlepost_breadcrumb(tree, header)
+        assert breadcrumb == ["Umwelt", "Wasser", "Trinkwasser"]
+
+    def test_no_collision_appends_full_breadcrumb(self) -> None:
+        # When banner title differs from the first breadcrumb entry, both are
+        # kept in order (banner first, then the full content breadcrumb).
+        header = "<h1 class='member-banner-title'>Antragsbörse</h1>"
+        content = "<ol class='breadcrumb'><li>Umwelt</li><li>Wasser</li></ol>"
+        tree = HTMLParser(content)
+        breadcrumb = _extract_singlepost_breadcrumb(tree, header)
+        assert breadcrumb == ["Antragsbörse", "Umwelt", "Wasser"]
+
+    def test_no_banner_returns_content_breadcrumb(self) -> None:
+        # No banner title -> just the content breadcrumb, unmodified.
+        header = ""
+        content = "<ol class='breadcrumb'><li>A</li><li>B</li></ol>"
+        tree = HTMLParser(content)
+        breadcrumb = _extract_singlepost_breadcrumb(tree, header)
+        assert breadcrumb == ["A", "B"]
+
+    def test_no_content_breadcrumb_returns_banner_only(self) -> None:
+        # No content breadcrumb -> just the banner title.
+        header = "<h1 class='member-banner-title'>Umwelt</h1>"
+        tree = HTMLParser("<div>no breadcrumb here</div>")
+        breadcrumb = _extract_singlepost_breadcrumb(tree, header)
+        assert breadcrumb == ["Umwelt"]
 
 
 class TestParseStructure:

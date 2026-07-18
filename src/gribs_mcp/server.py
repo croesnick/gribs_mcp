@@ -25,20 +25,21 @@ from gribs_mcp.models import (
 from gribs_mcp.parsers import parse_downloads
 
 # Category name -> category_id mapping.
-# Live-verified 2026-07-18 via /members/structure for each cat_id 1-24:
-# cat=1 Antragsbörse, cat=5 Arbeit im Rat, cat=6 Mitgliederbriefe,
-# cat=7 DenkWerkstatt, cat=8 Mitgliederversammlungen, cat=9 Kommunalwahl.
-# cat=2/3/4 return Antragsbörse variants (filtered views), NOT Wissenswert.
-# cat=10+ return empty navigation. Wissenswert loads asynchronously on the
-# homepage and its cat_id couldn't be mapped via the structure endpoint.
+# Live-verified 2026-07-18 via /members/structure for each cat_id 1-9:
+# cat=1 Antragsbörse, cat=2 Wissenswert, cat=5 Arbeit im Rat,
+# cat=6 Mitgliederbriefe, cat=7 DenkWerkstatt, cat=8 Mitgliederversammlungen,
+# cat=9 Kommunalwahl. The homepage /members/structure response lists all
+# sections in its `navigation` field (the async-load assumption from the
+# original Oracle review was wrong — Wissenswert IS in the structure response,
+# it just wasn't being mapped).
 CATEGORY_IDS: dict[str, int | None] = {
     "Antragsbörse": 1,  # verified
+    "Wissenswert": 2,  # verified 2026-07-18 via /members/structure
     "Arbeit im Rat": 5,  # verified
     "Mitgliederbriefe": 6,  # verified
     "DenkWerkstatt": 7,  # verified
     "Mitgliederversammlungen": 8,  # verified
     "Kommunalwahl": 9,  # verified
-    "Wissenswert": None,  # unverified — cat_ids 2/3/4 are Antragsbörse variants
 }
 
 DEFAULT_CATEGORY = "Antragsbörse"
@@ -85,7 +86,13 @@ def _resolve_category_id(category: str) -> int:
 
 
 def _clamp(limit: int, max_value: int) -> int:
-    """Clamp a limit to [1, max_value] per INTENT.md §Tool-Design."""
+    """Clamp a limit to [1, max_value] per INTENT.md §Tool-Design.
+
+    Negative or zero limits are clamped up to 1 (the minimum useful page size).
+    Values above `max_value` are clamped down to `max_value` (the API cap).
+    This never raises — MCP tool callers may pass arbitrary ints, and we
+    degrade gracefully rather than erroring on out-of-range input.
+    """
     return max(1, min(limit, max_value))
 
 

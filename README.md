@@ -118,17 +118,16 @@ The `category` parameter on `search_antraege`, `list_categories`, and `list_antr
 | Category name | cat_id | Status |
 |---|---|---|
 | `Antragsbörse` | 1 | verified |
+| `Wissenswert` | 2 | verified |
 | `Arbeit im Rat` | 5 | verified |
 | `Mitgliederbriefe` | 6 | verified |
 | `DenkWerkstatt` | 7 | verified |
 | `Mitgliederversammlungen` | 8 | verified |
 | `Kommunalwahl` | 9 | verified |
-| `Wissenswert` | — | unverified (see Known limitations) |
 
 ## Known limitations / roadmap
 
 - **`list_antraege_in_category` on leaf nodes returns an empty expansion** — gribs.net's `/members/expandStructure` returns a *search form* (not post listings) when called on a leaf subcategory. To list posts in a subcategory, call `search_antraege` with the same `l1`/`l2`/`l3` ids and a broad query (e.g. 'a' or 'der' — gribs doesn't support an empty searchstring).
-- **`Wissenswert` cat_id is unverified** — cat_ids 2/3/4 return Antragsbörse variants (filtered views), not Wissenswert. The Wissenswert section loads asynchronously on the homepage and couldn't be mapped via the structure endpoint alone. It's registered as `None` and will raise `GribsApiError` if used.
 - **`extract_downloads` keyword heuristic** — links are included if the URL ends in `.pdf` OR the anchor text contains a download keyword (download/pdf/antrag/vorlage/beschluss/musterantrag/herunterladen). This may produce false positives (e.g. a non-download link mentioning "antrag") or miss downloads with non-standard anchor text. The `is_pdf` flag distinguishes confirmed PDFs.
 
 ## Reverse-engineering notes
